@@ -374,12 +374,12 @@ pub fn execute_graph(
         }
 
         if let Some(m) = metrics.as_ref() {
-            m.lock().flush(graph);
+            m.lock().flush(&graph.pipes);
         }
     }
 
     // Ensure everything is done.
-    for pipe in graph.pipes.values() {
+    for pipe in graph.pipes.0.values() {
         assert!(pipe.send_state == PortState::Done && pipe.recv_state == PortState::Done);
     }
 

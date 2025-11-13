@@ -1,3 +1,4 @@
+use std::ops::Index;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -20,7 +21,18 @@ slotmap::new_key_type! {
 #[derive(Default)]
 pub struct Graph {
     pub nodes: SlotMap<GraphNodeKey, GraphNode>,
-    pub pipes: SlotMap<LogicalPipeKey, LogicalPipe>,
+    pub pipes: Pipes,
+}
+
+#[derive(Clone, Default)]
+pub struct Pipes(pub(crate) SlotMap<LogicalPipeKey, LogicalPipe>);
+
+impl Index<LogicalPipeKey> for Pipes {
+    type Output = LogicalPipe;
+
+    fn index(&self, index: LogicalPipeKey) -> &Self::Output {
+        self.0.index(index)
+    }
 }
 
 impl Graph {
@@ -28,7 +40,7 @@ impl Graph {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             nodes: SlotMap::with_capacity_and_key(capacity),
-            pipes: SlotMap::with_capacity_and_key(capacity),
+            pipes: Pipes(SlotMap::with_capacity_and_key(capacity)),
         }
     }
 
@@ -58,7 +70,7 @@ impl Graph {
             };
 
             // Add the pipe.
-            let pipe_key = self.pipes.insert(pipe);
+            let pipe_key = self.pipes.0.insert(pipe);
 
             // And connect input to output.
             self.nodes[node_key].inputs.push(pipe_key);
@@ -123,7 +135,7 @@ impl Graph {
 
             // Propagate information.
             for (input, state) in node.inputs.iter().zip(recv_state.iter()) {
-                let pipe = &mut self.pipes[*input];
+                let pipe = &mut self.pipes.0[*input];
                 if pipe.recv_state != *state {
                     assert!(
                         pipe.recv_state != PortState::Done,
@@ -137,7 +149,7 @@ impl Graph {
             }
 
             for (output, state) in node.outputs.iter().zip(send_state.iter()) {
-                let pipe = &mut self.pipes[*output];
+                let pipe = &mut self.pipes.0[*output];
                 if pipe.send_state != *state {
                     assert!(
                         pipe.send_state != PortState::Done,
@@ -164,6 +176,7 @@ pub struct GraphNode {
 
 /// A pipe sends data between nodes.
 #[allow(unused)] // TODO: remove.
+#[derive(Clone)]
 pub struct LogicalPipe {
     // Node that we send data to.
     pub sender: GraphNodeKey,

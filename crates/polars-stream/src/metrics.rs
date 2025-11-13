@@ -4,7 +4,7 @@ use std::time::Duration;
 use slotmap::SecondaryMap;
 
 use crate::async_executor::TaskMetrics;
-use crate::graph::{Graph, GraphNodeKey, LogicalPipeKey};
+use crate::graph::{GraphNodeKey, LogicalPipeKey, Pipes};
 use crate::pipe::PipeMetrics;
 
 #[derive(Default, Clone)]
@@ -60,7 +60,7 @@ impl NodeMetrics {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct GraphMetrics {
     node_metrics: SecondaryMap<GraphNodeKey, NodeMetrics>,
     in_progress_task_metrics: SecondaryMap<GraphNodeKey, Vec<Arc<TaskMetrics>>>,
@@ -92,7 +92,7 @@ impl GraphMetrics {
             .add_state_update(time);
     }
 
-    pub fn flush(&mut self, graph: &Graph) {
+    pub fn flush(&mut self, pipes: &Pipes) {
         for (key, in_progress_task_metrics) in self.in_progress_task_metrics.iter_mut() {
             for task_metrics in in_progress_task_metrics.drain(..) {
                 self.node_metrics
@@ -105,7 +105,7 @@ impl GraphMetrics {
 
         for (key, in_progress_pipe_metrics) in self.in_progress_pipe_metrics.iter_mut() {
             for pipe_metrics in in_progress_pipe_metrics.drain(..) {
-                let pipe = &graph.pipes[key];
+                let pipe = &pipes[key];
                 self.node_metrics
                     .entry(pipe.receiver)
                     .unwrap()
@@ -122,5 +122,9 @@ impl GraphMetrics {
 
     pub fn get(&self, key: GraphNodeKey) -> Option<&NodeMetrics> {
         self.node_metrics.get(key)
+    }
+
+    pub fn iter(&self) -> slotmap::secondary::Iter<'_, GraphNodeKey, NodeMetrics> {
+        self.node_metrics.iter()
     }
 }
