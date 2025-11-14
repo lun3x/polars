@@ -11,8 +11,9 @@ use polars_utils::pl_str::PlSmallStr;
 
 pub mod models;
 pub use models::{PhysNodeInfo, PhysicalPlanVisualizationData};
-use slotmap::SlotMap;
+use slotmap::{Key, SecondaryMap, SlotMap};
 
+use crate::graph::GraphNodeKey;
 use crate::physical_plan::visualization::models::{Edge, PhysNodeProperties};
 use crate::physical_plan::{PhysNode, PhysNodeKey, PhysNodeKind};
 
@@ -20,10 +21,12 @@ pub fn generate_visualization_data(
     title: PlSmallStr,
     roots: &[PhysNodeKey],
     phys_sm: &SlotMap<PhysNodeKey, PhysNode>,
+    phys_to_graph: &SecondaryMap<PhysNodeKey, GraphNodeKey>,
     expr_arena: &Arena<AExpr>,
 ) -> PhysicalPlanVisualizationData {
     let (nodes_list, edges) = PhysicalPlanVisualizationDataGenerator {
         phys_sm,
+        phys_to_graph,
         expr_arena,
         queue: VecDeque::from_iter(roots.iter().copied()),
         nodes_list: vec![],
@@ -41,6 +44,7 @@ pub fn generate_visualization_data(
 
 struct PhysicalPlanVisualizationDataGenerator<'a> {
     phys_sm: &'a SlotMap<PhysNodeKey, PhysNode>,
+    phys_to_graph: &'a SecondaryMap<PhysNodeKey, GraphNodeKey>,
     expr_arena: &'a Arena<AExpr>,
     queue: VecDeque<PhysNodeKey>,
     nodes_list: Vec<PhysNodeInfo>,
@@ -54,14 +58,15 @@ impl PhysicalPlanVisualizationDataGenerator<'_> {
         while let Some(key) = self.queue.pop_front() {
             let node: &PhysNode = self.phys_sm.get(key).unwrap();
             let mut phys_node_info = self.get_phys_node_info(node, &mut node_inputs);
-            let current_node_key: u64 = key.0.as_ffi();
-            phys_node_info.id = current_node_key;
+            let current_graph_key: u64 = self.phys_to_graph[key].data().as_ffi();
+            phys_node_info.id = current_graph_key;
 
             for input_node in node_inputs.drain(..) {
-                let input_node_key = input_node.0.as_ffi();
+                let input_graph_key = self.phys_to_graph[input_node].data().as_ffi();
 
                 self.queue.push_back(input_node);
-                self.edges.push(Edge::new(current_node_key, input_node_key));
+                self.edges
+                    .push(Edge::new(current_graph_key, input_graph_key));
             }
 
             self.nodes_list.push(phys_node_info);
