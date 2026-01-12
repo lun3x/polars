@@ -28,11 +28,9 @@ pyo3 = { workspace = true, optional = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 recursive = { workspace = true }
-schemars = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 slotmap = { workspace = true }
-strum_macros = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"] }
 
 arrow = { workspace = true }
@@ -89,18 +87,6 @@ dtype-extension = ["polars-core/dtype-extension", "polars-plan/dtype-extension"]
 ewma = ["polars-plan/ewma"]
 mode = ["polars-plan/mode"]
 object = ["polars-ops/object"]
-physical_plan_visualization = [
-  "dep:serde",
-  "dep:serde_json",
-  "polars-plan/ir_serde",
-  "strum_macros",
-]
-physical_plan_visualization_schema = [
-  "physical_plan_visualization",
-  "dep:schemars",
-  "polars-plan/dsl-schema",
-  "polars-utils/dsl-schema",
-]
 python = ["pyo3", "polars-plan/python", "polars-mem-engine/python", "polars-error/python"]
 semi_anti_join = ["polars-plan/semi_anti_join", "polars-ops/semi_anti_join"]
 is_in = ["polars-ops/is_in", "polars-plan/is_in", "semi_anti_join"]
