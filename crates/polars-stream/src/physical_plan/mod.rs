@@ -30,6 +30,7 @@ use polars_plan::plans::hive::HivePartitionsDf;
 use polars_plan::plans::options::JoinTypeOptionsIR;
 use polars_plan::plans::{AExpr, DataFrameUdf, DynamicPred, FunctionArgMap, IR};
 
+mod builder;
 mod fmt;
 mod io;
 mod lower_expr;
@@ -38,6 +39,7 @@ mod lower_ir;
 mod to_description;
 mod to_graph;
 
+pub use builder::PhysPlanBuilder;
 pub use fmt::{NodeStyle, visualize_plan};
 use polars_plan::prelude::PlanCallback;
 #[cfg(feature = "dynamic_group_by")]
@@ -924,29 +926,33 @@ fn fuse_drops(roots: Vec<PhysNodeKey>, phys_sm: &mut SlotMap<PhysNodeKey, PhysNo
     });
 }
 
+/// Lowers the IR rooted at `root` into `phys_sm` and returns the root physical node together
+/// with the filled slotmap.
 pub fn build_physical_plan(
     root: Node,
     ir_arena: &mut Arena<IR>,
     expr_arena: &mut Arena<AExpr>,
-    phys_sm: &mut SlotMap<PhysNodeKey, PhysNode>,
+    phys_sm: SlotMap<PhysNodeKey, PhysNode>,
     ctx: StreamingLowerIRContext<'_>,
-) -> PolarsResult<PhysNodeKey> {
+) -> PolarsResult<(PhysNodeKey, SlotMap<PhysNodeKey, PhysNode>)> {
     let mut schema_cache = PlHashMap::with_capacity(ir_arena.len());
     let mut expr_cache = ExprCache::with_capacity(expr_arena.len());
     let mut cache_nodes = PlHashMap::new();
+    let mut phys_sm = PhysPlanBuilder::new(phys_sm, ir_arena.len());
     let phys_root = lower_ir::lower_ir(
         root,
         ir_arena,
         expr_arena,
-        phys_sm,
+        &mut phys_sm,
         &mut schema_cache,
         &mut expr_cache,
         &mut cache_nodes,
         ctx,
         None,
     )?;
-    insert_multiplexers(vec![phys_root.node], phys_sm);
-    split_multiplexers(vec![phys_root.node], phys_sm);
-    fuse_drops(vec![phys_root.node], phys_sm);
-    Ok(phys_root.node)
+    insert_multiplexers(vec![phys_root.node], &mut phys_sm);
+    split_multiplexers(vec![phys_root.node], &mut phys_sm);
+    fuse_drops(vec![phys_root.node], &mut phys_sm);
+
+    Ok((phys_root.node, phys_sm.into_inner()))
 }
