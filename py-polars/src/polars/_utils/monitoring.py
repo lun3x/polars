@@ -9,6 +9,9 @@ MONITORING_ENV_VAR: Final[str] = "POLARS_QUERY_MONITORING"
 MONITORING_WORKSPACE_ENV_VAR: Final[str] = "POLARS_QUERY_MONITORING_WORKSPACE"
 MONITORING_ORGANIZATION_ENV_VAR: Final[str] = "POLARS_QUERY_MONITORING_ORGANIZATION"
 
+# Minimum version of polars_cloud required to enable local query monitoring
+MIN_POLARS_CLOUD_MONITORING_VERSION: Final[str] = "0.13.0"
+
 
 def monitoring_enabled_globally() -> bool:
     return os.environ.get(MONITORING_ENV_VAR) == "1"
@@ -31,7 +34,10 @@ def activate_monitoring() -> None:
     import_optional(
         "polars_cloud",
         err_prefix="query monitoring requires the",
+        min_version=MIN_POLARS_CLOUD_MONITORING_VERSION,
+        min_err_prefix="query monitoring requires",
         install_message=(
-            "Please install using the command `pip install 'polars-cloud>=0.13.0'`."
+            "Please install using the command "
+            f"`pip install 'polars-cloud>={MIN_POLARS_CLOUD_MONITORING_VERSION}'`."
         ),
     ).authenticate()

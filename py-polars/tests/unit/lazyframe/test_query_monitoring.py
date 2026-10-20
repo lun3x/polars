@@ -19,6 +19,7 @@ from polars._utils.monitoring import (
     MONITORING_ORGANIZATION_ENV_VAR,
     MONITORING_WORKSPACE_ENV_VAR,
 )
+from polars.exceptions import ModuleUpgradeRequiredError
 from polars.lazyframe.engine import StreamingEngine
 from tests.unit.conftest import mock_module_import
 
@@ -35,6 +36,7 @@ def fake_cloud_observer() -> tuple[ModuleType, MagicMock]:
         name="QueryCloudObserver", return_value=observer
     )
     module.authenticate = MagicMock(name="authenticate")  # type: ignore[attr-defined]
+    module.__version__ = "0.13.0"  # type: ignore[attr-defined]
     return module, observer
 
 
@@ -260,6 +262,16 @@ def test_engine_monitoring_requires_polars_cloud(
 ) -> None:
     monkeypatch.setitem(sys.modules, "polars_cloud", None)
     with pytest.raises(ModuleNotFoundError, match="polars_cloud"):
+        StreamingEngine(monitoring=True)
+
+
+def test_engine_monitoring_rejects_old_polars_cloud() -> None:
+    module, _ = fake_cloud_observer()
+    module.__version__ = "0.12.0"  # type: ignore[attr-defined]
+    with (
+        mock_module_import("polars_cloud", module, replace_if_exists=True),
+        pytest.raises(ModuleUpgradeRequiredError, match=r"0\.13\.0.*found 0\.12\.0"),
+    ):
         StreamingEngine(monitoring=True)
 
 
