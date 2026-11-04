@@ -179,7 +179,7 @@ def test_resolver_error_passes_through() -> None:
 
     pl.Config.set_iceberg_catalog_resolver(resolver)
 
-    with pytest.raises(ComputeError, match=r"^not connected$") as excinfo:
+    with pytest.raises(ComputeError, match=r"^not connected\n") as excinfo:
         resolve_catalog("sales")
     assert excinfo.value.__notes__ == [
         "raised by the Iceberg catalog resolver for catalog 'sales'"
@@ -364,7 +364,7 @@ def test_sink_surfaces_resolver_error_after_deserialize(sales: SqlCatalog) -> No
 
     pl.Config.set_iceberg_catalog_resolver(refusing)
 
-    with pytest.raises(ComputeError, match=r"^can only be resolved while planning$"):
+    with pytest.raises(ComputeError, match=r"^can only be resolved while planning\n"):
         pl.LazyFrame.deserialize(io.BytesIO(data)).collect()
     assert_frame_equal(table_rows(sales), pl.DataFrame({"a": [1, 2]}))
 
@@ -401,5 +401,5 @@ def test_sink_state_resolves_again_after_pickling(sales: SqlCatalog) -> None:
         raise ComputeError(msg)
 
     pl.Config.set_iceberg_catalog_resolver(refusing)
-    with pytest.raises(ComputeError, match=r"^can only be resolved while planning$"):
+    with pytest.raises(ComputeError, match=r"^can only be resolved while planning\n"):
         pickle.loads(data).commit([])
