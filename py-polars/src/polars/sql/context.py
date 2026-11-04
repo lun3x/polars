@@ -490,15 +490,10 @@ class SQLContext(Generic[FrameType]):
 
     def _execute_catalog_ddl(self, ddl: dict[str, Any]) -> LazyFrame:
         """Perform the catalog DDL that `catalog_ddl` returned."""
-        from polars.io.iceberg._catalog_resolver import resolve_catalog
+        from polars.io.iceberg._catalog_resolver import catalog_from
 
         config, instance, _ = self._catalogs[ddl["catalog"]]
-        if instance is not None:
-            catalog = instance
-        elif isinstance(config, str):
-            catalog = resolve_catalog(config)
-        else:
-            catalog = config.class_(config.name, **config.properties)
+        catalog = instance if instance is not None else catalog_from(config)
         if ddl["kind"] == "drop_table":
             response = _drop_catalog_table(catalog, ddl)
         elif ddl["kind"] == "create_table":
