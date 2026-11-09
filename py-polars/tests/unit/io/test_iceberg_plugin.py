@@ -1483,23 +1483,25 @@ def test_iceberg_plugin_catalog_storage_options(
     plmonkeypatch.setattr(
         table, "metadata_location", "s3://bucket/t/metadata/v1.metadata.json"
     )
+    properties = {
+        "s3.region": "eu-west-1",
+        "s3.access-key-id": "vended-key",
+        "s3.secret-access-key": "vended-secret",
+        # PyIceberg timeouts are in seconds.
+        "s3.connect-timeout": "60",
+        "s3.request-timeout": "1.5",
+    }
+    plmonkeypatch.setattr(table.io, "properties", properties)
+    # Configured on the catalog, so static: vended keys would be refreshed by a
+    # `CredentialProviderIceberg` instead.
     plmonkeypatch.setattr(
-        table.io,
-        "properties",
-        {
-            "s3.region": "eu-west-1",
-            "s3.access-key-id": "vended-key",
-            "s3.secret-access-key": "vended-secret",
-            # PyIceberg timeouts are in seconds.
-            "s3.connect-timeout": "60",
-            "s3.request-timeout": "1.5",
-        },
+        table.catalog, "properties", {**table.catalog.properties, **properties}
     )
 
-    # The table's catalog is known, so the vended credentials come from a
-    # `CredentialProviderIceberg` instead of the options.
     assert _capture_plugin_scan_storage_options(table, plmonkeypatch, None) == {
         "aws_region": "eu-west-1",
+        "aws_access_key_id": "vended-key",
+        "aws_secret_access_key": "vended-secret",
         "connect_timeout": "60000ms",
         "timeout": "1500ms",
     }
@@ -1514,7 +1516,7 @@ def test_iceberg_plugin_catalog_storage_options(
         "aws_profile": "p",
     }
 
-    # Other options keep the catalog's credentials (in the provider).
+    # Other options keep them.
     assert _capture_plugin_scan_storage_options(
         table,
         plmonkeypatch,
@@ -1526,6 +1528,8 @@ def test_iceberg_plugin_catalog_storage_options(
         },
     ) == {
         "aws_region": "us-east-1",
+        "aws_access_key_id": "vended-key",
+        "aws_secret_access_key": "vended-secret",
         "connect_timeout": "60000ms",
         "timeout": "1500ms",
         "max_retries": "3",

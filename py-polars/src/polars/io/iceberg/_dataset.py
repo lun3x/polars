@@ -78,8 +78,7 @@ class IcebergScanTableSerializer(IcebergTableSerializer):
         """
         from polars.io.iceberg._credentials import (
             catalog_storage_options,
-            cloud_scheme,
-            split_credential_options,
+            split_vended_options,
         )
 
         catalog = (
@@ -93,7 +92,9 @@ class IcebergScanTableSerializer(IcebergTableSerializer):
         except NotImplementedError:
             vended = False
         else:
-            vended = bool(split_credential_options(options, cloud_scheme(location))[1])
+            vended = bool(
+                split_vended_options(options, table.catalog.properties, location)[1]
+            )
 
         return IcebergLoadedTableState(
             metadata_location=location,

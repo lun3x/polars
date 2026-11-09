@@ -357,6 +357,33 @@ _PROVIDER_KEY_TO_ICEBERG_PROPERTY = {
 }
 
 
+def split_vended_options(
+    options: Mapping[str, Any],
+    configured_properties: Mapping[str, Any] | None,
+    location: str,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """
+    Split object store options into `(static, vended credentials)`.
+
+    As `split_credential_options`, but credentials with the value the catalog's own
+    configuration (`configured_properties`) gives are static: PyIceberg merges what
+    the catalog vends into the table's FileIO properties, not the catalog's.
+    """
+    try:
+        configured = catalog_storage_options(configured_properties or {}, location)
+    except NotImplementedError:
+        configured = {}
+    configured_keys = {
+        k for k, v in options.items() if k in configured and configured[k] == v
+    }
+    rest, credentials = split_credential_options(
+        {k: v for k, v in options.items() if k not in configured_keys},
+        cloud_scheme(location),
+    )
+    static = {k: v for k, v in options.items() if k in configured_keys or k in rest}
+    return static, credentials
+
+
 def provider_credentials_to_iceberg_properties(
     credentials: Mapping[str, str], scheme: CloudScheme | None
 ) -> dict[str, str]:
@@ -390,6 +417,7 @@ def catalog_credentials(
     catalog_properties: Mapping[str, Any],
     user_storage_options: Mapping[str, Any] | None,
     on_unsupported: Literal["raise", "user_options"] = "raise",
+    configured_properties: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], CredentialProviderIceberg | None]:
     """
     Object store options for a table, and a provider of its vended credentials.
@@ -398,6 +426,10 @@ def catalog_credentials(
     replace the catalog's as a whole. Vended credentials are refreshed by a
     `CredentialProviderIceberg` (and left out of the options) when the user gave
     none and the catalog and table are known; otherwise the provider is `None`.
+
+    Credentials with the value the catalog's own configuration
+    (`configured_properties`, e.g. `catalog.properties`) gives were not vended, and
+    stay in the options.
 
     Properties without an object store equivalent raise `NotImplementedError`, or
     with `on_unsupported="user_options"`, yield only the user's options.
@@ -435,7 +467,7 @@ def catalog_credentials(
         return options, None
 
     options.update(user_options)
-    static, credentials = split_credential_options(options, cloud_scheme(location))
+    static, credentials = split_vended_options(options, configured_properties, location)
     if not credentials:
         if verbose():
             eprint(f"catalog_credentials: {table_identifier}: nothing vended")

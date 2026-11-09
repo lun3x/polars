@@ -461,6 +461,57 @@ def test_catalog_credentials_unsupported_property_policy() -> None:
     assert (static, provider) == ({"aws_region": "us-east-1"}, None)
 
 
+def test_catalog_credentials_configured_keys_are_static() -> None:
+    # The catalog's own configuration carries the keys: nothing was vended.
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties={**VENDED, "uri": "sqlite://"},
+        user_storage_options=None,
+        configured_properties={**VENDED, "uri": "sqlite://"},
+    )
+    assert provider is None
+    assert static == {
+        "aws_access_key_id": "AK",
+        "aws_secret_access_key": "SK",
+        "aws_session_token": "T",
+        "aws_region": "eu-west-1",
+    }
+
+
+def test_catalog_credentials_keys_differing_from_configured_are_vended() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+        configured_properties={**GLUE, "s3.access-key-id": "CONFIGURED"},
+    )
+    assert isinstance(provider, CredentialProviderIceberg)
+    assert static == {"aws_region": "eu-west-1"}
+
+
+def test_catalog_credentials_without_configured_properties() -> None:
+    kwargs: dict[str, Any] = {
+        "catalog": "sales",
+        "table_identifier": ("ns", "t"),
+        "location": S3_LOC,
+        "catalog_properties": VENDED,
+        "user_storage_options": None,
+    }
+    static, provider = cred.catalog_credentials(**kwargs, configured_properties=None)
+    assert static == {"aws_region": "eu-west-1"}
+    assert isinstance(provider, CredentialProviderIceberg)
+    # An unsupported configuration is treated as configuring nothing.
+    static, provider = cred.catalog_credentials(
+        **kwargs, configured_properties={**VENDED, "s3.role-arn": "arn"}
+    )
+    assert static == {"aws_region": "eu-west-1"}
+    assert isinstance(provider, CredentialProviderIceberg)
+
+
 def wrap_for_name(name: str, identifier: str = "ns.t") -> IcebergTableWrap:
     return IcebergTableWrap(
         table_=NoPickleOption(None),
@@ -523,6 +574,56 @@ def test_loaded_state_glue_like_is_not_vended(sales: SqlCatalog) -> None:
     assert isinstance(state, IcebergLoadedTableState)
     assert state.vended is False
     assert state.catalog == IcebergCatalogConfig.from_catalog(sales)
+
+
+def test_loaded_state_configured_keys_are_not_vended(
+    tmp_path: Path, vending: VendingCatalog
+) -> None:
+    sales = new_catalog(
+        tmp_path,
+        "configured",
+        pl.DataFrame({"a": [1]}),
+        **{"s3.access-key-id": "AK", "s3.secret-access-key": "SK"},
+    )
+    tbl = sales.load_table(("ns", "t"))
+    assert tbl.io.properties["s3.access-key-id"] == "AK"
+    state = roundtrip(wrap_for_table(tbl)).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.vended is False
+
+    state = roundtrip(wrap_for_table(vending.load_table(("ns", "t"))))
+    assert isinstance(state.table_descriptor_, IcebergLoadedTableState)
+    assert state.table_descriptor_.vended is True
+
+
+def test_plugin_scan_configured_keys_engage_no_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    from polars.io.iceberg import _plugin
+
+    sales = new_catalog(
+        tmp_path,
+        "configured",
+        pl.DataFrame({"a": [1]}),
+        **{"s3.access-key-id": "AK", "s3.secret-access-key": "SK"},
+    )
+    seen: dict[str, Any] = {}
+    real = _plugin.catalog_credentials
+
+    def recording_catalog_credentials(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        seen["result"] = real(**kwargs)
+        return seen["result"]
+
+    monkeypatch.setattr(_plugin, "catalog_credentials", recording_catalog_credentials)
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "plugin")
+    tbl = sales.load_table(("ns", "t"))
+    pl.scan_iceberg(tbl).collect()
+    assert seen["configured_properties"] is tbl.catalog.properties
+    static, provider = seen["result"]
+    assert provider is None
+    assert static["aws_access_key_id"] == "AK"
 
 
 def test_get_on_vended_state_fetches_then_loads_from_metadata_location(
