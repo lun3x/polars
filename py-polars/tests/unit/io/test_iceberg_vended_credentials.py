@@ -315,6 +315,18 @@ def test_provider_falls_back_to_load_table_when_load_credentials_fails(
     assert creds["aws_access_key_id"] == "AK1"
 
 
+def test_provider_falls_back_to_load_table_when_load_credentials_vends_nothing(
+    tmp_path: Path,
+) -> None:
+    # E.g. no prefix matches the location, or the server vends through `loadTable`.
+    cat = new_vending_catalog(tmp_path, with_load_credentials=True)
+    cat.load_credentials = lambda identifier, location: {}  # type: ignore[attr-defined]
+    pl.Config.set_iceberg_catalog_resolver(recording(cat)[0])
+    creds, _ = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)()
+    assert creds["aws_access_key_id"] == "AK1"
+    assert cat.vends == 1
+
+
 def test_provider_resolves_name_through_resolver(vending: VendingCatalog) -> None:
     resolver, names = recording(vending)
     pl.Config.set_iceberg_catalog_resolver(resolver)

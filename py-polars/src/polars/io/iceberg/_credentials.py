@@ -500,7 +500,9 @@ def fetch_vended_properties(
     FileIO properties, including vended credentials, for a table at `location`.
 
     Asks the catalog's `load_credentials` (REST catalogs) if it has one, and falls
-    back to loading the table if that fails (e.g. the server lacks the endpoint).
+    back to loading the table if that fails (e.g. the server lacks the endpoint) or
+    returns no credentials (e.g. none for the location's prefix, or the server
+    vends them with the table).
     """
     load_credentials = getattr(catalog, "load_credentials", None)
     if callable(load_credentials):
@@ -513,13 +515,31 @@ def fetch_vended_properties(
                     f"failed, falling back to load_table ({error = })"
                 )
         else:
+            if _has_credentials(properties, location):
+                if verbose():
+                    eprint(
+                        f"fetch_vended_properties: {identifier}: via load_credentials"
+                    )
+                return properties
             if verbose():
-                eprint(f"fetch_vended_properties: {identifier}: via load_credentials")
-            return properties
+                eprint(
+                    f"fetch_vended_properties: {identifier}: load_credentials "
+                    "returned no credentials, falling back to load_table"
+                )
 
     if verbose():
         eprint(f"fetch_vended_properties: {identifier}: via load_table")
     return dict(catalog.load_table(identifier).io.properties)
+
+
+def _has_credentials(properties: Mapping[str, Any], location: str) -> bool:
+    """Whether FileIO `properties` hold credentials for `location`."""
+    try:
+        options = catalog_storage_options(properties, location)
+    except NotImplementedError:
+        # Not for the fallback to decide; the caller raises.
+        return True
+    return bool(split_credential_options(options, cloud_scheme(location))[1])
 
 
 def vended_expiry(
