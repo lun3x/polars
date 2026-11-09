@@ -1496,10 +1496,10 @@ def test_iceberg_plugin_catalog_storage_options(
         },
     )
 
+    # The table's catalog is known, so the vended credentials come from a
+    # `CredentialProviderIceberg` instead of the options.
     assert _capture_plugin_scan_storage_options(table, plmonkeypatch, None) == {
         "aws_region": "eu-west-1",
-        "aws_access_key_id": "vended-key",
-        "aws_secret_access_key": "vended-secret",
         "connect_timeout": "60000ms",
         "timeout": "1500ms",
     }
@@ -1514,7 +1514,7 @@ def test_iceberg_plugin_catalog_storage_options(
         "aws_profile": "p",
     }
 
-    # Other options keep them.
+    # Other options keep the catalog's credentials (in the provider).
     assert _capture_plugin_scan_storage_options(
         table,
         plmonkeypatch,
@@ -1526,8 +1526,6 @@ def test_iceberg_plugin_catalog_storage_options(
         },
     ) == {
         "aws_region": "us-east-1",
-        "aws_access_key_id": "vended-key",
-        "aws_secret_access_key": "vended-secret",
         "connect_timeout": "60000ms",
         "timeout": "1500ms",
         "max_retries": "3",

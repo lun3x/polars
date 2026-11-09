@@ -16,6 +16,7 @@ from pyiceberg.catalog.sql import SqlCatalog
 from polars.io.cloud._utils import NoPickleOption
 from polars.io.cloud.credential_provider import CredentialProviderIceberg
 from polars.io.iceberg import _credentials as cred
+from polars.io.iceberg._cache import plugin_storage_scope
 from polars.io.iceberg._dataset import (
     IcebergCatalogConfig,
     IcebergCatalogTableDescriptor,
@@ -622,3 +623,101 @@ def test_provider_credentials_to_iceberg_properties(
     creds: dict[str, str], scheme: cred.CloudScheme | None, expected: dict[str, str]
 ) -> None:
     assert cred.provider_credentials_to_iceberg_properties(creds, scheme) == expected
+
+
+def test_provider_pickles_identically_after_verbose_cache_hit(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_VERBOSE", "1")
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t"), S3_LOC
+    )
+    before = pickle.dumps(p)
+    p()
+    # A cache hit under verbose logs once, and remembers that it did.
+    p()
+    assert p._has_logged_use_cache
+    assert pickle.dumps(p) == before
+
+
+def test_plugin_scan_wiring(
+    monkeypatch: pytest.MonkeyPatch, vending: VendingCatalog
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    from polars.io.iceberg import _plugin
+
+    seen: dict[str, Any] = {}
+
+    def fake_catalog_credentials(**kwargs: Any) -> tuple[dict[str, Any], None]:
+        seen.update(kwargs)
+        return {"aws_region": "eu-west-1"}, None
+
+    monkeypatch.setattr(_plugin, "catalog_credentials", fake_catalog_credentials)
+    tbl = vending.load_table(("ns", "t"))
+    _plugin.plugin_scan(
+        tbl,
+        snapshot_id=None,
+        from_snapshot_id_exclusive=None,
+        to_snapshot_id_inclusive=None,
+        projection=None,
+        filter_columns=None,
+        statistics_columns=None,
+        iceberg_table_filter=None,
+        limit=None,
+        use_metadata_statistics=True,
+        fast_deletion_count=False,
+        user_storage_options=None,
+        catalog="sales",
+        table_identifier=("ns", "t"),
+    )
+    assert seen["catalog"] == "sales"
+    assert seen["table_identifier"] == ("ns", "t")
+    assert seen["catalog_properties"] is tbl.io.properties
+    assert seen["on_unsupported"] == "raise"
+
+
+def test_plugin_scan_passes_vended_credential_provider(
+    monkeypatch: pytest.MonkeyPatch, vending: VendingCatalog
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    import polars._plr as plr
+    from polars.io.cloud.credential_provider._builder import (
+        CredentialProviderBuilder,
+    )
+
+    seen: dict[str, Any] = {}
+    real_plugin_scan = plr._iceberg_plugin_scan
+
+    def recording_plugin_scan(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_plugin_scan(*args, **kwargs)
+
+    monkeypatch.setattr(plr, "_iceberg_plugin_scan", recording_plugin_scan)
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "plugin")
+
+    df = pl.scan_iceberg(vending.load_table(("ns", "t"))).collect()
+
+    assert df.to_dict(as_series=False) == {"a": [1, 2]}
+    builder = seen["credential_provider"]
+    assert isinstance(builder, CredentialProviderBuilder)
+    provider = builder.credential_provider_init.credential_provider  # type: ignore[attr-defined]
+    assert isinstance(provider, CredentialProviderIceberg)
+    assert provider.table_identifier == ("ns", "t")
+    assert "aws_access_key_id" not in (seen["storage_options"] or {})
+    assert seen["metadata_cache_scope"] is not None
+
+
+def test_plugin_storage_scope_ignores_credential_values(
+    vending: VendingCatalog,
+) -> None:
+    tbl = vending.load_table(("ns", "t"))
+    a = plugin_storage_scope(tbl.io, None, provider_scope=b"k")
+    assert a is not None
+    tbl.io.properties["s3.session-token"] = "CHANGED"
+    tbl.io.properties["s3.session-token-expires-at-ms"] = "1"
+    assert plugin_storage_scope(tbl.io, None, provider_scope=b"k") == a
+    assert plugin_storage_scope(tbl.io, None, provider_scope=b"other") != a
+    # Without a provider, the credentials stay in the scope.
+    b = plugin_storage_scope(tbl.io, None)
+    tbl.io.properties["s3.session-token"] = "CHANGED AGAIN"
+    assert plugin_storage_scope(tbl.io, None) != b

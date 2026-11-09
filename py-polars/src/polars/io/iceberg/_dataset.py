@@ -676,6 +676,7 @@ class IcebergScanResolver:
                     "plan with the polars_iceberg plugin"
                 )
 
+            catalog, table_identifier = self.table.catalog_source()
             try:
                 lf = plugin_scan(
                     tbl,
@@ -690,6 +691,10 @@ class IcebergScanResolver:
                     use_metadata_statistics=self.use_metadata_statistics,
                     fast_deletion_count=self.fast_deletion_count,
                     user_storage_options=self.table.iceberg_storage_properties,
+                    catalog=catalog,
+                    table_identifier=(
+                        table_identifier if catalog is not None else None
+                    ),
                 )
             except NotImplementedError as e:
                 # A table feature the plugin does not support (e.g. equality deletes),

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import os
+import pickle
 from typing import TYPE_CHECKING, Any
 
 from polars._utils.logging import verbose
@@ -25,6 +26,7 @@ from polars._utils.wrap import wrap_ldf
 from polars._warnings import issue_warning
 from polars.exceptions import ComputeError, PerformanceWarning
 from polars.io.cloud.credential_provider._builder import (
+    CredentialProviderBuilder,
     _init_credential_provider_builder,
 )
 from polars.io.iceberg._cache import (
@@ -59,13 +61,16 @@ from polars.io.iceberg._credentials import (
     _property_is_true as _property_is_true,
 )
 from polars.io.iceberg._credentials import (
-    _storage_options,
+    _storage_options as _storage_options,
 )
 from polars.io.iceberg._credentials import (
     _url_scheme as _url_scheme,
 )
 from polars.io.iceberg._credentials import (
     _user_storage_options as _user_storage_options,
+)
+from polars.io.iceberg._credentials import (
+    catalog_credentials,
 )
 from polars.io.iceberg._credentials import (
     catalog_storage_options as _catalog_storage_options,
@@ -78,6 +83,7 @@ if TYPE_CHECKING:
 
     from polars import LazyFrame
     from polars._typing import StorageOptionsDict
+    from polars.io.iceberg._credentials import CatalogSource
 
 # Python distribution name of the plugin, as used with pip.
 PLUGIN_PACKAGE_NAME = "polars_iceberg"
@@ -165,8 +171,15 @@ def plugin_scan(
     use_metadata_statistics: bool,
     fast_deletion_count: bool,
     user_storage_options: StorageOptionsDict | None,
+    catalog: CatalogSource | None,
+    table_identifier: tuple[str, ...] | None,
 ) -> LazyFrame:
-    """Plan the scan of `tbl` with the plugin; returns the native parquet scan."""
+    """
+    Plan the scan of `tbl` with the plugin; returns the native parquet scan.
+
+    `catalog` and `table_identifier` locate the table in its catalog, to refresh
+    vended credentials; `None` when unknown.
+    """
     from polars.io.iceberg._utils import name_mapping_by_field_id
 
     plr = _plr()
@@ -185,22 +198,36 @@ def plugin_scan(
         msg = "iceberg: unsupported: table without a metadata location"
         raise NotImplementedError(msg)
 
-    storage_options = _storage_options(
-        tbl.io.properties, metadata_location, user_storage_options
-    )
-
-    credential_provider = _init_credential_provider_builder(
-        "auto", metadata_location, storage_options, "scan_iceberg"
+    # Catalog-provided IO properties (e.g. vended credentials) with known object store
+    # equivalents, overridden by the user's storage options. Vended credentials are
+    # refreshed by a provider when the table's catalog is known.
+    storage_options, provider = catalog_credentials(
+        catalog=catalog,
+        table_identifier=table_identifier,
+        location=metadata_location,
+        catalog_properties=tbl.io.properties,
+        user_storage_options=user_storage_options,
+        on_unsupported="raise",
     )
 
     # Immutable metadata files are cached across scans with the same storage
     # configuration, as with the PyIceberg planner.
     metadata_cache = get_metadata_file_cache()
-    metadata_cache_scope = (
-        plugin_storage_scope(tbl.io, user_storage_options)
-        if metadata_cache.enabled
-        else None
-    )
+    metadata_cache_scope = None
+    if provider is not None:
+        credential_provider = CredentialProviderBuilder.from_initialized_provider(
+            provider
+        )
+        if metadata_cache.enabled:
+            metadata_cache_scope = plugin_storage_scope(
+                tbl.io, user_storage_options, provider_scope=pickle.dumps(provider)
+            )
+    else:
+        credential_provider = _init_credential_provider_builder(
+            "auto", metadata_location, storage_options, "scan_iceberg"
+        )
+        if metadata_cache.enabled:
+            metadata_cache_scope = plugin_storage_scope(tbl.io, user_storage_options)
 
     return wrap_ldf(
         plr._iceberg_plugin_scan(

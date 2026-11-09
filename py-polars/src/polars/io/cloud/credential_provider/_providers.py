@@ -708,6 +708,12 @@ class CredentialProviderIceberg(CachingCredentialProvider):
     def _table_name(self) -> str:
         return ".".join(self.table_identifier)
 
+    def __getstate__(self) -> dict[str, Any]:
+        # Pickles identically however it was used, so that the pickle can key caches.
+        state = self.__dict__.copy()
+        state["_has_logged_use_cache"] = False
+        return state
+
     def __repr__(self) -> str:
         catalog = self.catalog if isinstance(self.catalog, str) else self.catalog.name
         return (
