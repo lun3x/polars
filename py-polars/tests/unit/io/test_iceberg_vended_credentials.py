@@ -1082,3 +1082,46 @@ def test_sink_without_vending_unchanged(
     pl.DataFrame({"a": [3]}).lazy().sink_iceberg("ns.t", catalog=sales, mode="append")
     assert "credential_provider" not in seen
     assert seen["storage_options"] == {}
+
+
+def test_sink_staged_create_engages_no_provider(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pyiceberg.table import StagedTable
+
+    from polars.io.iceberg import _sink
+
+    # The catalog cannot vend credentials for a table it does not know yet.
+    provider = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t2"), S3_LOC
+    )
+    calls: list[dict[str, Any]] = []
+
+    def vend(**kw: Any) -> tuple[dict[str, Any], CredentialProviderIceberg]:
+        calls.append(kw)
+        return {"aws_region": "eu-west-1"}, provider
+
+    monkeypatch.setattr(_sink, "catalog_credentials", vend)
+    seen: dict[str, Any] = {}
+    real = pl.LazyFrame.sink_parquet
+
+    def spy(self: pl.LazyFrame, path: Any, **kw: Any) -> Any:
+        seen.update(kw)
+        return real(self, path, **kw)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", spy)
+    lf = pl.DataFrame({"a": [3]}).lazy()
+    transaction = vending.create_table_transaction(
+        ("ns", "t2"), schema=lf.collect().to_arrow().schema
+    )
+    state = IcebergSinkState.new_create(transaction)
+    assert isinstance(state.table(), StagedTable)
+    state.attach_sink(lf).collect()
+
+    assert calls == []
+    assert "credential_provider" not in seen
+    assert seen["storage_options"] == {}
+    assert_frame_equal(
+        pl.scan_iceberg(vending.load_table(("ns", "t2"))).collect(),
+        pl.DataFrame({"a": [3]}),
+    )

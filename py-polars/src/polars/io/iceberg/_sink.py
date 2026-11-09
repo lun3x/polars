@@ -1467,7 +1467,7 @@ class IcebergSinkState:
         return evolved_schema, schema_to_pyarrow(source_schema)
 
     def _attach_resolved_sink(self, plf: PyLazyFrame) -> PyLazyFrame:
-        from pyiceberg.table import TableProperties
+        from pyiceberg.table import StagedTable, TableProperties
         from pyiceberg.utils.properties import property_as_bool, property_as_int
 
         import polars as pl
@@ -1559,8 +1559,10 @@ class IcebergSinkState:
         credential_options: dict[str, Any] = {
             "storage_options": self._get_converted_storage_options()
         }
-        # Optional in REST catalog responses, despite the annotation.
-        if table.metadata_location is not None:
+        # A staged table is unknown to its catalog until the commit, so the catalog
+        # cannot refresh its credentials. `metadata_location` is optional in REST
+        # catalog responses, despite the annotation.
+        if not isinstance(table, StagedTable) and table.metadata_location is not None:
             static_options, provider = catalog_credentials(
                 catalog=self.catalog_source(),
                 table_identifier=tuple(table.name()),
