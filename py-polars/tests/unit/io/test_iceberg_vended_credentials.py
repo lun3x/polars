@@ -625,6 +625,22 @@ def test_loaded_state_from_table_object_carries_catalog_config(
     assert state.vended is True
 
 
+def test_loaded_state_unreadable_properties_are_not_vended(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tbl = vending.load_table(("ns", "t"))
+
+    def malformed(properties: Any, location: str) -> dict[str, Any]:
+        msg = "malformed property value"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(cred, "catalog_storage_options", malformed)
+    # Pickling does not fail where it did before vended credentials were refreshed.
+    state = roundtrip(wrap_for_table(tbl)).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.vended is False
+
+
 def test_loaded_state_static_table_has_no_source(sales: SqlCatalog) -> None:
     from pyiceberg.table import StaticTable
 

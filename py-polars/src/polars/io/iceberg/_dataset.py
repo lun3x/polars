@@ -93,13 +93,19 @@ class IcebergScanTableSerializer(IcebergTableSerializer):
         )
         location = table.metadata_location
         try:
-            options = catalog_storage_options(table.io.properties, location)
-        except NotImplementedError:
-            vended = False
-        else:
             vended = bool(
-                split_vended_options(options, table.catalog.properties, location)[1]
+                split_vended_options(
+                    catalog_storage_options(table.io.properties, location),
+                    table.catalog.properties,
+                    location,
+                )[1]
             )
+        except Exception as error:
+            # Unsupported or malformed properties: not refreshed, and the table
+            # still pickles.
+            if verbose():
+                eprint(f"IcebergScanTableSerializer: not vended ({error = })")
+            vended = False
 
         return IcebergLoadedTableState(
             metadata_location=location,
