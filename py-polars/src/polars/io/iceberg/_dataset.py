@@ -20,6 +20,7 @@ from polars.io.iceberg._cache import (
     load_static_table,
 )
 from polars.io.iceberg._catalog_resolver import catalog_from
+from polars.io.iceberg._credentials import catalog_credentials
 from polars.io.iceberg._plugin import (
     _native_storage_options,
     plugin_planner_required,
@@ -52,6 +53,9 @@ if TYPE_CHECKING:
 
     from polars._typing import StorageOptionsDict
     from polars.io.cloud._utils import NoPickleOption
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderIceberg,
+    )
     from polars.io.iceberg._credentials import CatalogSource
     from polars.lazyframe.frame import LazyFrame
 
@@ -1023,12 +1027,34 @@ class IcebergScanResolver:
                 else None
             )
 
-            # The table's FileIO properties, as for the plugin's scans
-            storage_options = _native_storage_options(
-                tbl,
-                self.table.iceberg_storage_properties,
-                sources[0] if sources else None,
-            )
+            # Vended credentials are refreshed by a provider when the table's
+            # catalog is known. Otherwise the table's FileIO properties apply, as
+            # for the plugin's scans.
+            static_options: StorageOptionsDict = {}
+            credential_provider: CredentialProviderIceberg | None = None
+            # Optional in REST catalog responses, despite the annotation.
+            if tbl.metadata_location is not None:
+                catalog, table_identifier = self.table.catalog_source()
+                static_options, credential_provider = catalog_credentials(
+                    catalog=catalog,
+                    table_identifier=table_identifier,
+                    location=tbl.metadata_location,
+                    catalog_properties=tbl.io.properties,
+                    user_storage_options=self.table.iceberg_storage_properties,
+                    on_unsupported="user_options",
+                    configured_properties=tbl.catalog.properties,
+                )
+
+            storage_options: StorageOptionsDict | None
+            if credential_provider is not None:
+                storage_options = static_options
+            else:
+                # The table's FileIO properties, as for the plugin's scans
+                storage_options = _native_storage_options(
+                    tbl,
+                    self.table.iceberg_storage_properties,
+                    sources[0] if sources else None,
+                )
 
             return _NativeIcebergScanData(
                 sources=sources,
@@ -1055,6 +1081,7 @@ class IcebergScanResolver:
                 min_max_statistics=min_max_statistics,
                 statistics_loader=statistics_loader,
                 storage_options=storage_options,
+                credential_provider=credential_provider,
                 row_count=(
                     (total_physical_rows, total_deleted_rows)
                     if (
@@ -1139,9 +1166,24 @@ class _NativeIcebergScanData(_ResolvedScanDataBase):
     # (physical, deleted)
     row_count: tuple[int, int] | None
     snapshot_id_key: str
+    # Refreshes vended credentials; `None` leaves `scan_parquet`'s default.
+    credential_provider: CredentialProviderIceberg | None = None
 
     def to_lazyframe(self) -> pl.LazyFrame:
+        from polars.io.cloud.credential_provider._builder import (
+            CredentialProviderBuilder,
+        )
         from polars.io.parquet.functions import scan_parquet
+
+        credential_provider_kwargs: dict[str, Any] = (
+            {
+                "credential_provider": CredentialProviderBuilder.from_initialized_provider(
+                    self.credential_provider
+                )
+            }
+            if self.credential_provider is not None
+            else {}
+        )
 
         return scan_parquet(
             self.sources,
@@ -1164,6 +1206,7 @@ class _NativeIcebergScanData(_ResolvedScanDataBase):
             _table_statistics_tight=True,
             _row_count=self.row_count,
             _source_sizes=self.source_sizes,
+            **credential_provider_kwargs,
         )
 
 

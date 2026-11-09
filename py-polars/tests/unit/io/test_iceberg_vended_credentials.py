@@ -23,7 +23,10 @@ from polars.io.iceberg._dataset import (
     IcebergLoadedTableState,
     IcebergScanTableSerializer,
     IcebergTableWrap,
+    _NativeIcebergScanData,
 )
+from polars.testing import assert_frame_equal
+from tests.unit.io.test_iceberg import new_iceberg_scan_resolver
 
 pytestmark = pytest.mark.write_disk
 
@@ -822,3 +825,63 @@ def test_plugin_storage_scope_ignores_credential_values(
     b = plugin_storage_scope(tbl.io, None)
     tbl.io.properties["s3.session-token"] = "CHANGED AGAIN"
     assert plugin_storage_scope(tbl.io, None) != b
+
+
+def test_native_scan_data_carries_provider(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    from polars.io.iceberg import _dataset
+
+    monkeypatch.setattr(
+        _dataset,
+        "catalog_credentials",
+        lambda **kw: (
+            {"aws_region": "eu-west-1"},
+            CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC),
+        ),
+    )
+    tbl = vending.load_table(("ns", "t"))
+    scan_data = new_iceberg_scan_resolver(tbl)._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    assert scan_data.storage_options == {"aws_region": "eu-west-1"}
+    assert isinstance(scan_data.credential_provider, CredentialProviderIceberg)
+
+
+def test_native_scan_engages_vended_credential_provider(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    tbl = vending.load_table(("ns", "t"))
+    scan_data = new_iceberg_scan_resolver(tbl)._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    assert isinstance(scan_data.credential_provider, CredentialProviderIceberg)
+    assert scan_data.credential_provider.table_identifier == ("ns", "t")
+    assert "aws_access_key_id" not in (scan_data.storage_options or {})
+    # Local reads do not use the provider.
+    assert_frame_equal(scan_data.to_lazyframe().collect(), pl.DataFrame({"a": [1, 2]}))
+
+
+def test_native_scan_glue_role_arn_keeps_ambient_credentials(
+    sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    tbl = sales.load_table(("ns", "t"))
+    tbl.io.properties["s3.role-arn"] = "arn:aws:iam::1:role/r"
+    scan_data = new_iceberg_scan_resolver(tbl)._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    assert scan_data.storage_options is None
+    assert scan_data.credential_provider is None
+    assert_frame_equal(scan_data.to_lazyframe().collect(), pl.DataFrame({"a": [1, 2]}))
+
+
+def test_native_scan_without_vending_unchanged(
+    sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    scan_data = new_iceberg_scan_resolver(
+        sales.load_table(("ns", "t"))
+    )._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    assert scan_data.storage_options is None
+    assert scan_data.credential_provider is None
