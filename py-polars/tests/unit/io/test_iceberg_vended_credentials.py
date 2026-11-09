@@ -676,6 +676,26 @@ def test_get_on_vended_state_surfaces_refusing_resolver(
         wrap.get()
 
 
+def test_get_on_vended_state_keeps_user_credentials(vending: VendingCatalog) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    loaded = wrap_for_name("sales")
+    loaded.iceberg_storage_properties = {
+        "s3.access-key-id": "USERKEY",
+        "s3.secret-access-key": "S",
+    }
+    loaded.get()
+    wrap = roundtrip(loaded)
+    names.clear()
+    vending.vends = 0
+    tbl = wrap.get()
+    # The user's credentials replace the catalog's as a whole.
+    assert names == []
+    assert vending.vends == 0
+    assert tbl.io.properties["s3.access-key-id"] == "USERKEY"
+    assert "s3.session-token" not in tbl.io.properties
+
+
 def test_get_on_vended_gcs_state_installs_token_expiry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

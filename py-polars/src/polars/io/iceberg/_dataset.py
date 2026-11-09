@@ -22,6 +22,7 @@ from polars.io.iceberg._cache import (
 from polars.io.iceberg._catalog_resolver import catalog_from
 from polars.io.iceberg._credentials import catalog_credentials
 from polars.io.iceberg._plugin import (
+    _is_credential_key,
     _native_storage_options,
     plugin_planner_required,
     plugin_scan,
@@ -267,10 +268,19 @@ class IcebergTableWrap:
         return self.table_.get()  # type: ignore[return-value]
 
     def _load_from_state(self, state: IcebergLoadedTableState) -> pyiceberg.table.Table:
-        """Load the state's snapshot, with credentials vended afresh if it had any."""
-        properties: dict[str, Any] = dict(self.iceberg_storage_properties or {})
+        """
+        Load the state's snapshot, with credentials vended afresh if it had any.
 
-        if state.vended and state.catalog is not None:
+        The user's credentials replace the catalog's as a whole: with any, nothing
+        is fetched.
+        """
+        properties: dict[str, Any] = dict(self.iceberg_storage_properties or {})
+        user_has_credentials = any(
+            _is_credential_key(k)
+            for k in _convert_iceberg_to_object_store_storage_options(properties)
+        )
+
+        if state.vended and state.catalog is not None and not user_has_credentials:
             from polars.io.cloud.credential_provider._providers import (
                 CredentialProviderIceberg,
             )
