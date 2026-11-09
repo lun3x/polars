@@ -72,6 +72,12 @@ class RefreshingPyArrowFileIO(PyArrowFileIO):
         state = super().__getstate__()
         for k in ("_lock", "_fs_cache", "_last_credentials"):
             state.pop(k, None)
+        # Credentials are not pickled; the provider installs them again.
+        state["properties"] = {
+            k: v
+            for k, v in state["properties"].items()
+            if not _is_credential_property(k)
+        }
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:

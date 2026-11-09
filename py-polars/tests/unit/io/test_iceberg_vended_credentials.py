@@ -938,16 +938,25 @@ def test_refreshing_file_io_pickles_without_credentials() -> None:
 
     io = RefreshingPyArrowFileIO({"s3.region": "eu-west-1"}, CountingProvider())
     io.fs_by_scheme("file", None)
+    assert io.properties["s3.access-key-id"] == "A1"
     state = io.__getstate__()
     assert "_fs_cache" not in state
     assert "_last_credentials" not in state
+    for key in ("s3.access-key-id", "s3.secret-access-key", "s3.session-token"):
+        assert key not in state["properties"]
+    assert state["properties"]["s3.region"] == "eu-west-1"
+    # Pickling leaves the live FileIO's credentials in place.
+    assert io.properties["s3.session-token"] == "T1"
 
     restored = pickle.loads(pickle.dumps(io))
     assert isinstance(restored, RefreshingPyArrowFileIO)
-    assert restored.properties["s3.region"] == "eu-west-1"
-    # The restored FileIO asks its provider again.
+    assert restored.properties == {"s3.region": "eu-west-1"}
+    # The restored FileIO installs the provider's current credentials.
+    restored._provider.creds["aws_session_token"] = "T2"  # type: ignore[attr-defined]
     restored.fs_by_scheme("file", None)
     assert restored._provider.calls == 2  # type: ignore[attr-defined]
+    assert restored.properties["s3.access-key-id"] == "A1"
+    assert restored.properties["s3.session-token"] == "T2"
 
 
 def test_with_refreshing_io_replaces_only_pyarrow_io(vending: VendingCatalog) -> None:
