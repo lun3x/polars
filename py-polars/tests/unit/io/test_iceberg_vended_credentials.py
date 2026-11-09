@@ -885,3 +885,139 @@ def test_native_scan_without_vending_unchanged(
     assert isinstance(scan_data, _NativeIcebergScanData)
     assert scan_data.storage_options is None
     assert scan_data.credential_provider is None
+
+
+class CountingProvider(CredentialProviderIceberg):
+    """Returns `creds`, counting calls."""
+
+    def __init__(self) -> None:
+        # Bypasses `__init__` validation: a stand-in for tests of the FileIO only.
+        self.calls = 0
+        self.creds = {
+            "aws_access_key_id": "A1",
+            "aws_secret_access_key": "S",
+            "aws_session_token": "T1",
+        }
+        self.scheme = "aws"
+
+    def __call__(self) -> tuple[dict[str, str], int | None]:  # type: ignore[override]
+        self.calls += 1
+        return dict(self.creds), None
+
+
+def test_refreshing_file_io_rebuilds_fs_only_when_credentials_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from polars.io.iceberg._file_io import RefreshingPyArrowFileIO
+
+    p = CountingProvider()
+    io = RefreshingPyArrowFileIO({}, p)
+    builds: list[tuple[str, str | None]] = []
+
+    def initialize_fs(scheme: str, netloc: str | None = None) -> object:
+        builds.append((scheme, netloc))
+        return object()
+
+    monkeypatch.setattr(io, "_initialize_fs", initialize_fs)
+    fs1 = io.fs_by_scheme("file", None)
+    fs2 = io.fs_by_scheme("file", None)
+    assert fs1 is fs2
+    assert builds == [("file", None)]
+    assert p.calls == 2
+    assert io.properties["s3.access-key-id"] == "A1"
+
+    p.creds["aws_session_token"] = "T2"
+    fs3 = io.fs_by_scheme("file", None)
+    assert fs3 is not fs1
+    assert len(builds) == 2
+    assert io.properties["s3.session-token"] == "T2"
+
+
+def test_refreshing_file_io_pickles_without_credentials() -> None:
+    from polars.io.iceberg._file_io import RefreshingPyArrowFileIO
+
+    io = RefreshingPyArrowFileIO({"s3.region": "eu-west-1"}, CountingProvider())
+    io.fs_by_scheme("file", None)
+    state = io.__getstate__()
+    assert "_fs_cache" not in state
+    assert "_last_credentials" not in state
+
+    restored = pickle.loads(pickle.dumps(io))
+    assert isinstance(restored, RefreshingPyArrowFileIO)
+    assert restored.properties["s3.region"] == "eu-west-1"
+    # The restored FileIO asks its provider again.
+    restored.fs_by_scheme("file", None)
+    assert restored._provider.calls == 2  # type: ignore[attr-defined]
+
+
+def test_with_refreshing_io_replaces_only_pyarrow_io(vending: VendingCatalog) -> None:
+    from pyiceberg.io.fsspec import FsspecFileIO
+
+    from polars.io.iceberg._file_io import RefreshingPyArrowFileIO, with_refreshing_io
+
+    tbl = vending.load_table(("ns", "t"))
+    assert tbl.io.properties["s3.access-key-id"] == "AK1"
+    out = with_refreshing_io(tbl, CountingProvider(), {"s3.region": "eu-west-1"})
+    assert isinstance(out.io, RefreshingPyArrowFileIO)
+    assert out is not tbl
+    assert out.metadata is tbl.metadata
+    assert "s3.access-key-id" not in out.io.properties
+    assert "s3.session-token-expires-at-ms" not in out.io.properties
+    assert out.io.properties["s3.region"] == "eu-west-1"
+    # The table's own FileIO is untouched.
+    assert tbl.io.properties["s3.access-key-id"] == "AK1"
+
+    tbl.io = FsspecFileIO(dict(tbl.io.properties))
+    out = with_refreshing_io(tbl, CountingProvider(), {})
+    assert out is not tbl
+    assert out.io is tbl.io
+
+
+def test_fallback_reader_uses_refreshing_io(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    import polars.io.iceberg._utils as utils
+    from polars.io.iceberg import _dataset
+
+    provider = CountingProvider()
+    monkeypatch.setattr(_dataset, "catalog_credentials", lambda **kw: ({}, provider))
+    tbl = vending.load_table(("ns", "t"))
+    seen: list[Table] = []
+    real = utils._scan_pyarrow_dataset_impl
+
+    def scan(t: Table, **kw: Any) -> Any:
+        seen.append(t)
+        return real(t, **kw)
+
+    monkeypatch.setattr(utils, "_scan_pyarrow_dataset_impl", scan)
+    assert_frame_equal(
+        pl.scan_iceberg(tbl, reader_override="pyiceberg").collect(),
+        pl.DataFrame({"a": [1, 2]}),
+    )
+    assert seen
+    assert type(seen[0].io).__name__ == "RefreshingPyArrowFileIO"
+    assert provider.calls > 0
+
+
+def test_fallback_reader_without_vending_keeps_table_io(
+    sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    import polars.io.iceberg._utils as utils
+
+    tbl = sales.load_table(("ns", "t"))
+    seen: list[Table] = []
+    real = utils._scan_pyarrow_dataset_impl
+
+    def scan(t: Table, **kw: Any) -> Any:
+        seen.append(t)
+        return real(t, **kw)
+
+    monkeypatch.setattr(utils, "_scan_pyarrow_dataset_impl", scan)
+    assert_frame_equal(
+        pl.scan_iceberg(tbl, reader_override="pyiceberg").collect(),
+        pl.DataFrame({"a": [1, 2]}),
+    )
+    assert seen
+    assert seen[0].io is tbl.io

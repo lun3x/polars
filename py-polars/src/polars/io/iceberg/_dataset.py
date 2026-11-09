@@ -458,6 +458,30 @@ class IcebergScanResolver:
     # The files to read, as planned by the caller: each is read in full.
     file_tasks: list[FileScanTask] | None = field(default=None, repr=False)
 
+    def _catalog_credentials(
+        self, tbl: pyiceberg.table.Table
+    ) -> tuple[StorageOptionsDict, CredentialProviderIceberg | None]:
+        """
+        Object store options for `tbl`, and a provider of its vended credentials.
+
+        Vended credentials are refreshed by a provider when the table's catalog is
+        known. Otherwise the user's options apply as before, and credentials are
+        resolved by the reader (e.g. ambient ones).
+        """
+        # Optional in REST catalog responses, despite the annotation.
+        if tbl.metadata_location is None:
+            return {}, None
+        catalog, table_identifier = self.table.catalog_source()
+        return catalog_credentials(
+            catalog=catalog,
+            table_identifier=table_identifier,
+            location=tbl.metadata_location,
+            catalog_properties=tbl.io.properties,
+            user_storage_options=self.table.iceberg_storage_properties,
+            on_unsupported="user_options",
+            configured_properties=tbl.catalog.properties,
+        )
+
     #
     # PythonDatasetProvider interface functions
     #
@@ -1030,20 +1054,7 @@ class IcebergScanResolver:
             # Vended credentials are refreshed by a provider when the table's
             # catalog is known. Otherwise the table's FileIO properties apply, as
             # for the plugin's scans.
-            static_options: StorageOptionsDict = {}
-            credential_provider: CredentialProviderIceberg | None = None
-            # Optional in REST catalog responses, despite the annotation.
-            if tbl.metadata_location is not None:
-                catalog, table_identifier = self.table.catalog_source()
-                static_options, credential_provider = catalog_credentials(
-                    catalog=catalog,
-                    table_identifier=table_identifier,
-                    location=tbl.metadata_location,
-                    catalog_properties=tbl.io.properties,
-                    user_storage_options=self.table.iceberg_storage_properties,
-                    on_unsupported="user_options",
-                    configured_properties=tbl.catalog.properties,
-                )
+            static_options, credential_provider = self._catalog_credentials(tbl)
 
             storage_options: StorageOptionsDict | None
             if credential_provider is not None:
@@ -1106,11 +1117,23 @@ class IcebergScanResolver:
 
         import polars.io.iceberg._utils
 
+        # The scan is reused while the snapshot is unchanged, but PyIceberg
+        # replaces the metadata of `tbl` on e.g. schema updates.
+        scan_tbl: pyiceberg.table.Table
+        if (credential_provider := self._catalog_credentials(tbl)[1]) is not None:
+            from polars.io.iceberg._file_io import with_refreshing_io
+
+            scan_tbl = with_refreshing_io(
+                tbl,
+                credential_provider,
+                self.table.iceberg_storage_properties or {},
+            )
+        else:
+            scan_tbl = copy.copy(tbl)
+
         func = partial(
             polars.io.iceberg._utils._scan_pyarrow_dataset_impl,
-            # The scan is reused while the snapshot is unchanged, but PyIceberg
-            # replaces the metadata of `tbl` on e.g. schema updates.
-            copy.copy(tbl),
+            scan_tbl,
             snapshot_id=snapshot_id,
             from_snapshot_id_exclusive=self.from_snapshot_id_exclusive,
             to_snapshot_id_inclusive=self.to_snapshot_id_inclusive,
