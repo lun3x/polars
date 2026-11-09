@@ -1125,3 +1125,90 @@ def test_sink_staged_create_engages_no_provider(
         pl.scan_iceberg(vending.load_table(("ns", "t2"))).collect(),
         pl.DataFrame({"a": [3]}),
     )
+
+
+@pytest.fixture(scope="module")
+def s3_base() -> Iterator[str]:
+    """A moto S3 server, after the one in `tests/unit/io/cloud/test_aws.py`."""
+    import socket
+
+    moto_server = pytest.importorskip("moto.server")
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = moto_server.ThreadedMotoServer("127.0.0.1", port)
+    server.start()
+    yield f"http://127.0.0.1:{port}"
+    server.stop()
+
+
+@pytest.mark.slow
+def test_refresh_end_to_end_on_s3(
+    s3_base: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    boto3 = pytest.importorskip("boto3")
+    import polars._plr as plr
+    from polars.io.cloud.credential_provider._builder import (
+        CredentialProviderBuilder,
+    )
+
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "plugin")
+    # pyarrow's S3 writes otherwise send aws-chunked bodies that moto stores as is.
+    monkeypatch.setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
+    # An expiry of 0 makes both the Python and the Rust credential caches fetch
+    # again on every request; a past expiry other than 0 is an error in Rust.
+    monkeypatch.setattr(cred, "vended_expiry", lambda *args, **kwargs: 0)
+
+    boto3.client(
+        "s3",
+        region_name="us-east-1",
+        endpoint_url=s3_base,
+        aws_access_key_id="x",
+        aws_secret_access_key="y",
+    ).create_bucket(Bucket="bucket")
+
+    cat = VendingCatalog(
+        "sales",
+        uri=f"sqlite:///{tmp_path}/c.db",
+        warehouse="s3://bucket/wh",
+        **{
+            "s3.endpoint": s3_base,
+            "s3.access-key-id": "x",
+            "s3.secret-access-key": "y",
+            "s3.region": "us-east-1",
+        },
+    )
+    cat.create_namespace("ns")
+    tbl = cat.create_table(
+        ("ns", "t"), schema=pl.DataFrame({"a": [1]}).to_arrow().schema
+    )
+    pl.DataFrame({"a": [1]}).write_iceberg(tbl, mode="append")
+    pl.DataFrame({"a": [2]}).write_iceberg(tbl, mode="append")
+
+    seen: dict[str, Any] = {}
+    real_plugin_scan = plr._iceberg_plugin_scan
+
+    def recording_plugin_scan(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_plugin_scan(*args, **kwargs)
+
+    monkeypatch.setattr(plr, "_iceberg_plugin_scan", recording_plugin_scan)
+
+    resolver, _ = recording(cat)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    before = cat.vends
+    out = pl.scan_iceberg(
+        "ns.t", catalog="sales", storage_options={"aws_endpoint_url": s3_base}
+    ).collect()
+
+    assert sorted(out["a"].to_list()) == [1, 2]
+    # One load_table at plan time, at least two provider fetches for two files.
+    assert cat.vends - before >= 3
+    builder = seen["credential_provider"]
+    assert isinstance(builder, CredentialProviderBuilder)
+    provider = builder.credential_provider_init.credential_provider  # type: ignore[attr-defined]
+    assert isinstance(provider, CredentialProviderIceberg)
+    assert provider.table_identifier == ("ns", "t")
+    assert "aws_access_key_id" not in (seen["storage_options"] or {})
