@@ -25,6 +25,7 @@ from polars.io.iceberg._dataset import (
     IcebergTableWrap,
     _NativeIcebergScanData,
 )
+from polars.io.iceberg._sink import IcebergSinkState
 from polars.testing import assert_frame_equal
 from tests.unit.io.test_iceberg import new_iceberg_scan_resolver
 
@@ -1030,3 +1031,54 @@ def test_fallback_reader_without_vending_keeps_table_io(
     )
     assert seen
     assert seen[0].io is tbl.io
+
+
+def test_sink_catalog_source_name_and_config(sales: SqlCatalog) -> None:
+    by_name = IcebergSinkState.new("ns.t", catalog="sales")
+    assert by_name.catalog_source() == "sales"
+    by_cfg = IcebergSinkState.new("ns.t", catalog=sales)
+    assert by_cfg.catalog_source() == IcebergCatalogConfig.from_catalog(sales)
+
+
+def test_sink_passes_provider_to_parquet_sink(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from polars.io.iceberg import _sink
+
+    provider = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t"), S3_LOC
+    )
+    monkeypatch.setattr(
+        _sink,
+        "catalog_credentials",
+        lambda **kw: ({"aws_region": "eu-west-1"}, provider),
+    )
+    seen: dict[str, Any] = {}
+    real = pl.LazyFrame.sink_parquet
+
+    def spy(self: pl.LazyFrame, path: Any, **kw: Any) -> Any:
+        seen.update(kw)
+        return real(self, path, **kw)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", spy)
+    pl.DataFrame({"a": [3]}).lazy().sink_iceberg("ns.t", catalog=vending, mode="append")
+    assert seen["storage_options"] == {"aws_region": "eu-west-1"}
+    assert seen["credential_provider"].credential_provider_init.credential_provider is (
+        provider
+    )
+
+
+def test_sink_without_vending_unchanged(
+    sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+    real = pl.LazyFrame.sink_parquet
+
+    def spy(self: pl.LazyFrame, path: Any, **kw: Any) -> Any:
+        seen.update(kw)
+        return real(self, path, **kw)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", spy)
+    pl.DataFrame({"a": [3]}).lazy().sink_iceberg("ns.t", catalog=sales, mode="append")
+    assert "credential_provider" not in seen
+    assert seen["storage_options"] == {}
