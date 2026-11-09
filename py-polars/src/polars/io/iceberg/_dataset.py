@@ -492,6 +492,7 @@ class IcebergScanResolver:
             user_storage_options=self.table.iceberg_storage_properties,
             on_unsupported="user_options",
             configured_properties=tbl.catalog.properties,
+            live_catalog=tbl.catalog,
         )
 
     #

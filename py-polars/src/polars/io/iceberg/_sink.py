@@ -1571,6 +1571,7 @@ class IcebergSinkState:
                 user_storage_options=self.iceberg_storage_properties,
                 on_unsupported="user_options",
                 configured_properties=table.catalog.properties,
+                live_catalog=table.catalog,
             )
             if provider is not None:
                 from polars.io.cloud.credential_provider._builder import (

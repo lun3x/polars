@@ -209,6 +209,7 @@ def plugin_scan(
         user_storage_options=user_storage_options,
         on_unsupported="raise",
         configured_properties=tbl.catalog.properties,
+        live_catalog=tbl.catalog,
     )
 
     # Immutable metadata files are cached across scans with the same storage

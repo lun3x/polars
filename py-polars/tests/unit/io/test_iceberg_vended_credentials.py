@@ -408,6 +408,49 @@ def test_catalog_credentials_engages_provider() -> None:
     assert provider.catalog == "sales"
 
 
+def test_catalog_credentials_reuses_live_catalog(vending: VendingCatalog) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    _, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+        live_catalog=vending,
+    )
+    assert provider is not None
+    creds, _ = provider()
+    assert names == []
+    assert vending.vends == 1
+    assert creds["aws_access_key_id"] == "AK1"
+    # Not pickled: a deserialized provider resolves the catalog again.
+    restored = pickle.loads(pickle.dumps(provider))
+    restored.clear_cached_credentials()
+    restored()
+    assert names == ["sales"]
+
+
+def test_catalog_credentials_ignores_noop_live_catalog(
+    vending: VendingCatalog,
+) -> None:
+    from pyiceberg.catalog.noop import NoopCatalog
+
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    _, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+        live_catalog=NoopCatalog("static"),
+    )
+    assert provider is not None
+    provider()
+    assert names == ["sales"]
+
+
 def test_catalog_credentials_merges_user_non_credential_options() -> None:
     static, provider = cred.catalog_credentials(
         catalog="sales",
@@ -901,6 +944,8 @@ def test_plugin_scan_passes_vended_credential_provider(
     provider = builder.credential_provider_init.credential_provider  # type: ignore[attr-defined]
     assert isinstance(provider, CredentialProviderIceberg)
     assert provider.table_identifier == ("ns", "t")
+    # The table's catalog is reused for the first fetch.
+    assert provider._catalog_.get() is vending
     assert "aws_access_key_id" not in (seen["storage_options"] or {})
     assert seen["metadata_cache_scope"] is not None
 
@@ -951,6 +996,8 @@ def test_native_scan_engages_vended_credential_provider(
     assert isinstance(scan_data, _NativeIcebergScanData)
     assert isinstance(scan_data.credential_provider, CredentialProviderIceberg)
     assert scan_data.credential_provider.table_identifier == ("ns", "t")
+    # The table's catalog is reused for the first fetch.
+    assert scan_data.credential_provider._catalog_.get() is vending
     assert "aws_access_key_id" not in (scan_data.storage_options or {})
     # Local reads do not use the provider.
     assert_frame_equal(scan_data.to_lazyframe().collect(), pl.DataFrame({"a": [1, 2]}))
@@ -1193,6 +1240,29 @@ def test_sink_passes_provider_to_parquet_sink(
     assert seen["credential_provider"].credential_provider_init.credential_provider is (
         provider
     )
+
+
+def test_sink_reuses_table_catalog_for_credentials(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from polars.io.iceberg import _sink
+
+    seen: list[tuple[Any, Any]] = []
+    real = _sink.catalog_credentials
+
+    def spy(**kw: Any) -> Any:
+        out = real(**kw)
+        seen.append((kw["live_catalog"], out[1]))
+        return out
+
+    monkeypatch.setattr(_sink, "catalog_credentials", spy)
+    pl.DataFrame({"a": [3]}).lazy().sink_iceberg("ns.t", catalog=vending, mode="append")
+    assert seen
+    # The sink's table's catalog (rebuilt where the plan runs) is reused.
+    for live_catalog, provider in seen:
+        assert isinstance(live_catalog, VendingCatalog)
+        assert isinstance(provider, CredentialProviderIceberg)
+        assert provider._catalog_.get() is live_catalog
 
 
 def test_sink_without_vending_unchanged(

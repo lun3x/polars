@@ -426,6 +426,7 @@ def catalog_credentials(
     user_storage_options: Mapping[str, Any] | None,
     on_unsupported: Literal["raise", "user_options"] = "raise",
     configured_properties: Mapping[str, Any] | None = None,
+    live_catalog: pyiceberg.catalog.Catalog | None = None,
 ) -> tuple[dict[str, Any], CredentialProviderIceberg | None]:
     """
     Object store options for a table, and a provider of its vended credentials.
@@ -441,6 +442,9 @@ def catalog_credentials(
 
     Properties without an object store equivalent raise `NotImplementedError`, or
     with `on_unsupported="user_options"`, yield only the user's options.
+
+    The provider fetches through `live_catalog` (e.g. `tbl.catalog`) in this
+    process, if given, instead of building the catalog from `catalog` again.
     """
     from polars.io.cloud.credential_provider._providers import (
         CredentialProviderIceberg,
@@ -488,9 +492,14 @@ def catalog_credentials(
             )
         return options, None
 
+    from pyiceberg.catalog.noop import NoopCatalog
+
     if verbose():
         eprint(f"catalog_credentials: {table_identifier}: vended credential provider")
-    return static, CredentialProviderIceberg(catalog, table_identifier, location)
+    provider = CredentialProviderIceberg(catalog, table_identifier, location)
+    if live_catalog is not None and not isinstance(live_catalog, NoopCatalog):
+        provider._catalog_.set(live_catalog)
+    return static, provider
 
 
 def fetch_vended_properties(
