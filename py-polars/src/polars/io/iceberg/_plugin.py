@@ -215,6 +215,7 @@ def plugin_scan(
     # configuration, as with the PyIceberg planner.
     metadata_cache = get_metadata_file_cache()
     metadata_cache_scope = None
+    credential_provider: CredentialProviderBuilder | None
     if provider is not None:
         credential_provider = CredentialProviderBuilder.from_initialized_provider(
             provider
