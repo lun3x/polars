@@ -676,6 +676,44 @@ def test_get_on_vended_state_surfaces_refusing_resolver(
         wrap.get()
 
 
+def test_get_on_vended_gcs_state_installs_token_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from polars.io.cloud.credential_provider import _providers
+    from polars.io.iceberg import _dataset
+
+    monkeypatch.setattr(
+        _providers.CredentialProviderIceberg,
+        "retrieve_credentials_impl",
+        lambda self: ({"bearer_token": "tok"}, 1_900_000_000),
+    )
+    loads: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        _dataset,
+        "_load_static_table",
+        lambda location, properties: loads.append(properties),
+    )
+    wrap = IcebergTableWrap(
+        table_=NoPickleOption(None),
+        table_descriptor_=IcebergLoadedTableState(
+            metadata_location=GCS_LOC,
+            catalog="sales",
+            table_identifier=("ns", "t"),
+            vended=True,
+        ),
+        serializer=IcebergScanTableSerializer(),
+        iceberg_storage_properties=None,
+    )
+    wrap.get()
+    # PyArrow takes a GCS token only with its expiry.
+    assert loads == [
+        {
+            "gcs.oauth2.token": "tok",
+            "gcs.oauth2.token-expires-at": "1900000000000",
+        }
+    ]
+
+
 def test_old_str_state_still_loads(sales: SqlCatalog) -> None:
     tbl = sales.load_table(("ns", "t"))
     wrap = IcebergTableWrap(
@@ -715,8 +753,16 @@ def test_catalog_source() -> None:
         ({"sas_token": "sig"}, "azure", {"adls.sas-token": "sig"}),
         ({"account_key": "a"}, "azure", {"adls.account-key": "a"}),
         ({"bearer_token": "b"}, "azure", {"adls.token": "b"}),
-        ({"bearer_token": "b"}, "gcp", {"gcs.oauth2.token": "b"}),
-        ({"bearer_token": "b"}, None, {"gcs.oauth2.token": "b"}),
+        (
+            {"bearer_token": "b"},
+            "gcp",
+            {"gcs.oauth2.token": "b", "gcs.oauth2.token-expires-at": "1700000000000"},
+        ),
+        (
+            {"bearer_token": "b"},
+            None,
+            {"gcs.oauth2.token": "b", "gcs.oauth2.token-expires-at": "1700000000000"},
+        ),
         (
             {"bearer_token": "b", "sas_token": "sig"},
             None,
@@ -727,7 +773,22 @@ def test_catalog_source() -> None:
 def test_provider_credentials_to_iceberg_properties(
     creds: dict[str, str], scheme: cred.CloudScheme | None, expected: dict[str, str]
 ) -> None:
-    assert cred.provider_credentials_to_iceberg_properties(creds, scheme) == expected
+    assert (
+        cred.provider_credentials_to_iceberg_properties(
+            creds, scheme, expiry=1_700_000_000
+        )
+        == expected
+    )
+
+
+def test_provider_credentials_to_iceberg_properties_gcs_default_expiry() -> None:
+    # PyArrow takes a GCS token only with its expiry.
+    before = int(time.time())
+    props = cred.provider_credentials_to_iceberg_properties(
+        {"bearer_token": "b"}, "gcp"
+    )
+    expires_at_ms = int(props["gcs.oauth2.token-expires-at"])
+    assert (before + 900) * 1000 <= expires_at_ms <= (int(time.time()) + 900) * 1000
 
 
 def test_provider_pickles_identically_after_verbose_cache_hit(
@@ -932,6 +993,40 @@ def test_refreshing_file_io_rebuilds_fs_only_when_credentials_change(
     assert fs3 is not fs1
     assert len(builds) == 2
     assert io.properties["s3.session-token"] == "T2"
+
+
+class GcpCountingProvider(CountingProvider):
+    """Returns a GCS token, and `expiry`."""
+
+    def __init__(self, expiry: int | None) -> None:
+        super().__init__()
+        self.creds = {"bearer_token": "tok"}
+        self.scheme = "gcp"
+        self.expiry = expiry
+
+    def __call__(self) -> tuple[dict[str, str], int | None]:  # type: ignore[override]
+        self.calls += 1
+        return dict(self.creds), self.expiry
+
+
+@pytest.mark.parametrize("expiry", [1_900_000_000, None])
+def test_refreshing_file_io_builds_gcs_fs_with_token_expiry(
+    expiry: int | None,
+) -> None:
+    from pyarrow.fs import GcsFileSystem
+
+    from polars.io.iceberg._file_io import RefreshingPyArrowFileIO
+
+    io = RefreshingPyArrowFileIO({"gcs.project-id": "p"}, GcpCountingProvider(expiry))
+    # PyArrow refuses a token without its expiry.
+    fs = io.fs_by_scheme("gs", "bucket")
+    assert isinstance(fs, GcsFileSystem)
+    assert io.properties["gcs.oauth2.token"] == "tok"
+    expires_at = int(io.properties["gcs.oauth2.token-expires-at"]) // 1000
+    if expiry is not None:
+        assert expires_at == expiry
+    else:
+        assert time.time() + 850 < expires_at <= time.time() + 900
 
 
 def test_refreshing_file_io_pickles_without_credentials() -> None:

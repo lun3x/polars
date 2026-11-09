@@ -281,9 +281,11 @@ class IcebergTableWrap:
             provider = CredentialProviderIceberg(
                 state.catalog, state.table_identifier, state.metadata_location
             )
-            credentials, _ = provider()
+            credentials, expiry = provider()
             properties.update(
-                provider_credentials_to_iceberg_properties(credentials, provider.scheme)
+                provider_credentials_to_iceberg_properties(
+                    credentials, provider.scheme, expiry
+                )
             )
 
         return _load_static_table(state.metadata_location, properties)

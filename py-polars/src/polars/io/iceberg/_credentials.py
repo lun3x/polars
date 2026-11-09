@@ -385,13 +385,17 @@ def split_vended_options(
 
 
 def provider_credentials_to_iceberg_properties(
-    credentials: Mapping[str, str], scheme: CloudScheme | None
+    credentials: Mapping[str, str],
+    scheme: CloudScheme | None,
+    expiry: int | None = None,
 ) -> dict[str, str]:
     """
     Iceberg FileIO properties for credentials a credential provider returned.
 
     A bearer token is an ADLS token for `"azure"`, and a GCS token for `"gcp"`, or
-    for `None` when no Azure credential is present.
+    for `None` when no Azure credential is present. A GCS token comes with its
+    expiry (PyArrow takes the token only with one): `expiry` (Unix time in seconds,
+    as the provider returned it), or `DEFAULT_TTL_SECONDS` from now.
     """
     if scheme == "azure" or (
         scheme is None and ("account_key" in credentials or "sas_token" in credentials)
@@ -406,6 +410,10 @@ def provider_credentials_to_iceberg_properties(
             properties[bearer_token_property] = v
         elif k in _PROVIDER_KEY_TO_ICEBERG_PROPERTY:
             properties[_PROVIDER_KEY_TO_ICEBERG_PROPERTY[k]] = v
+    if "gcs.oauth2.token" in properties:
+        if expiry is None:
+            expiry = int(time.time() + DEFAULT_TTL_SECONDS)
+        properties[GCS_OAUTH2_TOKEN_EXPIRES_AT] = str(expiry * 1000)
     return properties
 
 

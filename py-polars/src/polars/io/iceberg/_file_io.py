@@ -47,7 +47,7 @@ class RefreshingPyArrowFileIO(PyArrowFileIO):
     def _refreshing_fs_by_scheme(
         self, scheme: str, netloc: str | None = None
     ) -> FileSystem:
-        credentials, _ = self._provider()
+        credentials, expiry = self._provider()
         # PyIceberg reads files from a thread pool.
         with self._lock:
             if credentials != self._last_credentials:
@@ -57,7 +57,7 @@ class RefreshingPyArrowFileIO(PyArrowFileIO):
                     self.properties.pop(k, None)
                 self.properties.update(
                     provider_credentials_to_iceberg_properties(
-                        credentials, self._provider.scheme
+                        credentials, self._provider.scheme, expiry
                     )
                 )
                 self._fs_cache.clear()
