@@ -3152,9 +3152,10 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
 
             When the catalog vends storage credentials, the plan carries a
             credential provider that asks the catalog again when they expire,
-            through the resolver where the plan runs. A scan of a `pyiceberg`
-            `Table` object carries its catalog's configuration, including its
-            properties, in the plan, as a sink's does.
+            through the resolver for a catalog name, or by rebuilding the catalog
+            from its pickled configuration otherwise. A sink to a `pyiceberg`
+            `Table` target carries its catalog's configuration, including its
+            properties, in the plan, as a scan of a `Table` object does.
 
             .. warning::
                 Passing a catalog name is considered **unstable**. It may be
