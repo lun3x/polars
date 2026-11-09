@@ -14,7 +14,7 @@ pytest.importorskip("pyiceberg.catalog.sql")
 from pyiceberg.catalog.sql import SqlCatalog
 
 from polars.io.cloud._utils import NoPickleOption
-from polars.io.cloud.credential_provider import CredentialProviderIceberg
+from polars.io.cloud.credential_provider._providers import CredentialProviderIceberg
 from polars.io.iceberg import _credentials as cred
 from polars.io.iceberg._cache import plugin_storage_scope
 from polars.io.iceberg._dataset import (
@@ -264,6 +264,13 @@ def recording(catalog: Catalog) -> tuple[Callable[[str], Catalog], list[str]]:
         return catalog
 
     return resolve, names
+
+
+def test_provider_is_not_public() -> None:
+    import polars.io.cloud.credential_provider as credential_provider
+
+    assert "CredentialProviderIceberg" not in credential_provider.__all__
+    assert not hasattr(credential_provider, "CredentialProviderIceberg")
 
 
 def test_provider_returns_only_credential_keys_and_expiry(
