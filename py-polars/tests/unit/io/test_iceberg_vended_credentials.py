@@ -360,3 +360,94 @@ def test_provider_repr_names_catalog_and_table() -> None:
     r = repr(CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC))
     assert "sales" in r
     assert "ns.t" in r
+
+
+VENDED = {
+    "s3.access-key-id": "AK",
+    "s3.secret-access-key": "SK",
+    "s3.session-token": "T",
+    "s3.region": "eu-west-1",
+}
+GLUE = {"s3.region": "eu-west-1"}
+
+
+def test_catalog_credentials_engages_provider() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+    )
+    assert static == {"aws_region": "eu-west-1"}
+    assert isinstance(provider, CredentialProviderIceberg)
+    assert provider.catalog == "sales"
+
+
+def test_catalog_credentials_merges_user_non_credential_options() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options={"aws_endpoint_url": "http://x"},
+    )
+    assert static == {"aws_region": "eu-west-1", "aws_endpoint_url": "http://x"}
+    assert provider is not None
+
+
+def test_catalog_credentials_user_credentials_win() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options={"aws_profile": "me"},
+    )
+    assert provider is None
+    assert "aws_access_key_id" not in static
+    assert static["aws_profile"] == "me"
+
+
+def test_catalog_credentials_nothing_vended() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=GLUE,
+        user_storage_options=None,
+    )
+    assert (static, provider) == ({"aws_region": "eu-west-1"}, None)
+
+
+def test_catalog_credentials_no_source_keeps_static_keys() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog=None,
+        table_identifier=None,
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+    )
+    assert provider is None
+    assert static["aws_access_key_id"] == "AK"
+
+
+def test_catalog_credentials_unsupported_property_policy() -> None:
+    props = {**GLUE, "s3.role-arn": "arn:aws:iam::1:role/r"}
+    with pytest.raises(NotImplementedError):
+        cred.catalog_credentials(
+            catalog="sales",
+            table_identifier=("ns", "t"),
+            location=S3_LOC,
+            catalog_properties=props,
+            user_storage_options=None,
+        )
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=props,
+        user_storage_options={"aws_region": "us-east-1"},
+        on_unsupported="user_options",
+    )
+    assert (static, provider) == ({"aws_region": "us-east-1"}, None)

@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
     import pyiceberg.catalog
 
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderIceberg,
+    )
     from polars.io.iceberg._dataset import IcebergCatalogConfig
 
     import pyiceberg.table
@@ -340,6 +343,77 @@ def split_credential_options(
         else:
             static[k] = v
     return static, credentials
+
+
+def catalog_credentials(
+    *,
+    catalog: CatalogSource | None,
+    table_identifier: tuple[str, ...] | None,
+    location: str,
+    catalog_properties: Mapping[str, Any],
+    user_storage_options: Mapping[str, Any] | None,
+    on_unsupported: Literal["raise", "user_options"] = "raise",
+) -> tuple[dict[str, Any], CredentialProviderIceberg | None]:
+    """
+    Object store options for a table, and a provider of its vended credentials.
+
+    The catalog's options are overridden by the user's; the user's credentials
+    replace the catalog's as a whole. Vended credentials are refreshed by a
+    `CredentialProviderIceberg` (and left out of the options) when the user gave
+    none and the catalog and table are known; otherwise the provider is `None`.
+
+    Properties without an object store equivalent raise `NotImplementedError`, or
+    with `on_unsupported="user_options"`, yield only the user's options.
+    """
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderIceberg,
+    )
+    from polars.io.iceberg._dataset import (
+        _convert_iceberg_to_object_store_storage_options,
+    )
+    from polars.io.iceberg._plugin import _is_credential_key
+
+    user_options = _convert_iceberg_to_object_store_storage_options(
+        dict(user_storage_options or {})
+    )
+
+    try:
+        options = catalog_storage_options(catalog_properties, location)
+    except NotImplementedError as error:
+        if on_unsupported != "user_options":
+            raise
+        if verbose():
+            eprint(f"catalog_credentials: {table_identifier}: user options ({error})")
+        return user_options, None
+
+    if any(_is_credential_key(k) for k in user_options):
+        # Mixing the user's credentials with the catalog's (e.g. a profile with
+        # vended keys) is ambiguous, and rejected by the credential provider.
+        options = {
+            k: v for k, v in options.items() if k not in _CATALOG_CREDENTIAL_KEYS
+        }
+        options.update(user_options)
+        if verbose():
+            eprint(f"catalog_credentials: {table_identifier}: user credentials")
+        return options, None
+
+    options.update(user_options)
+    static, credentials = split_credential_options(options, cloud_scheme(location))
+    if not credentials:
+        if verbose():
+            eprint(f"catalog_credentials: {table_identifier}: nothing vended")
+        return options, None
+    if catalog is None or table_identifier is None:
+        if verbose():
+            eprint(
+                f"catalog_credentials: {table_identifier}: vended credentials "
+                "without a catalog source, not refreshed"
+            )
+        return options, None
+
+    if verbose():
+        eprint(f"catalog_credentials: {table_identifier}: vended credential provider")
+    return static, CredentialProviderIceberg(catalog, table_identifier, location)
 
 
 def fetch_vended_properties(
