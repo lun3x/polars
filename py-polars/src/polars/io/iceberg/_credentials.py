@@ -15,10 +15,18 @@ from polars._utils.logging import eprint, verbose
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from typing import TypeAlias
+
+    import pyiceberg.catalog
+
+    from polars.io.iceberg._dataset import IcebergCatalogConfig
 
     import pyiceberg.table
 
 CloudScheme = Literal["aws", "azure", "gcp"]
+
+# A catalog as a plan carries it: a config to build it from, or a name to resolve.
+CatalogSource: TypeAlias = "IcebergCatalogConfig | str"
 
 # Expiry of vended credentials, in integer milliseconds since the epoch.
 S3_SESSION_TOKEN_EXPIRES_AT_MS = "s3.session-token-expires-at-ms"
@@ -332,6 +340,35 @@ def split_credential_options(
         else:
             static[k] = v
     return static, credentials
+
+
+def fetch_vended_properties(
+    catalog: pyiceberg.catalog.Catalog, identifier: tuple[str, ...], location: str
+) -> dict[str, Any]:
+    """
+    FileIO properties, including vended credentials, for a table at `location`.
+
+    Asks the catalog's `load_credentials` (REST catalogs) if it has one, and falls
+    back to loading the table if that fails (e.g. the server lacks the endpoint).
+    """
+    load_credentials = getattr(catalog, "load_credentials", None)
+    if callable(load_credentials):
+        try:
+            properties = dict(load_credentials(identifier, location))
+        except Exception as error:
+            if verbose():
+                eprint(
+                    f"fetch_vended_properties: {identifier}: load_credentials "
+                    f"failed, falling back to load_table ({error = })"
+                )
+        else:
+            if verbose():
+                eprint(f"fetch_vended_properties: {identifier}: via load_credentials")
+            return properties
+
+    if verbose():
+        eprint(f"fetch_vended_properties: {identifier}: via load_table")
+    return dict(catalog.load_table(identifier).io.properties)
 
 
 def vended_expiry(

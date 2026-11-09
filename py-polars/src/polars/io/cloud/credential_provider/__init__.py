@@ -5,6 +5,7 @@ from polars.io.cloud.credential_provider._providers import (
     CredentialProviderFunction,
     CredentialProviderFunctionReturn,
     CredentialProviderGCP,
+    CredentialProviderIceberg,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "CredentialProviderFunction",
     "CredentialProviderFunctionReturn",
     "CredentialProviderGCP",
+    "CredentialProviderIceberg",
 ]

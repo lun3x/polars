@@ -24,7 +24,10 @@ from polars.io.cloud._utils import NoPickleOption
 if TYPE_CHECKING:
     from typing import TypeAlias
 
+    import pyiceberg.catalog
+
     from polars._dependencies import boto3
+    from polars.io.iceberg._credentials import CatalogSource, CloudScheme
 
 from polars._utils.unstable import issue_unstable_warning
 
@@ -622,6 +625,95 @@ class CredentialProviderGCP(CachingCredentialProvider):
         if importlib.util.find_spec("google.auth") is None:
             msg = "google-auth must be installed to use `CredentialProviderGCP`"
             raise ImportError(msg)
+
+
+class CredentialProviderIceberg(CachingCredentialProvider):
+    """
+    Credentials vended by an Iceberg catalog for a table, fetched again on expiry.
+
+    .. warning::
+        This functionality is considered **unstable**. It may be changed
+        at any point without it being considered a breaking change.
+    """
+
+    def __init__(
+        self,
+        catalog: CatalogSource,
+        table_identifier: tuple[str, ...],
+        location: str,
+    ) -> None:
+        """
+        Initialize a credential provider for an Iceberg table.
+
+        Parameters
+        ----------
+        catalog
+            The catalog: a config to build it from, or a name to resolve with the
+            current Iceberg catalog resolver.
+        table_identifier
+            The table's identifier in the catalog.
+        location
+            The table's metadata location, which selects the credentials.
+        """
+        from polars.io.iceberg._credentials import cloud_scheme
+
+        self.catalog = catalog
+        self.table_identifier = tuple(table_identifier)
+        self.location = location
+        self.scheme: CloudScheme | None = cloud_scheme(location)
+        # Reused across refreshes in this process; built again after unpickling.
+        self._catalog_: NoPickleOption[pyiceberg.catalog.Catalog] = NoPickleOption()
+
+        super().__init__()
+
+    def retrieve_credentials_impl(self) -> CredentialProviderFunctionReturn:
+        """Fetch the credentials."""
+        from polars.exceptions import ComputeError
+        from polars.io.iceberg._catalog_resolver import catalog_from
+        from polars.io.iceberg._credentials import (
+            catalog_storage_options,
+            fetch_vended_properties,
+            split_credential_options,
+            vended_expiry,
+        )
+
+        catalog = self._catalog_.get()
+        if catalog is None:
+            catalog = catalog_from(self.catalog)
+            self._catalog_.set(catalog)
+
+        properties = fetch_vended_properties(
+            catalog, self.table_identifier, self.location
+        )
+        options = catalog_storage_options(properties, self.location)
+        _, credentials = split_credential_options(options, self.scheme)
+
+        if not credentials:
+            msg = (
+                "iceberg: catalog vended no storage credentials for "
+                f"{self._table_name()}"
+            )
+            raise ComputeError(msg)
+
+        expiry = vended_expiry(properties, self.location)
+
+        if verbose():
+            eprint(
+                f"[{self!r}]: fetched credentials from {catalog!r}: "
+                f"{sorted(credentials)}, {expiry = }"
+            )
+
+        return credentials, expiry
+
+    def _table_name(self) -> str:
+        return ".".join(self.table_identifier)
+
+    def __repr__(self) -> str:
+        catalog = self.catalog if isinstance(self.catalog, str) else self.catalog.name
+        return (
+            f"CredentialProviderIceberg[catalog={catalog!r}, "
+            f"table={self._table_name()!r}]"
+        )
 
 
 class UserProvidedGCPToken(CredentialProvider):

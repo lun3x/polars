@@ -1,12 +1,30 @@
 from __future__ import annotations
 
+import pickle
+import time
+from typing import TYPE_CHECKING, Any
+
 import pytest
+
+import polars as pl
+from polars.exceptions import ComputeError
 
 pytest.importorskip("pyiceberg.catalog.sql")
 
+from pyiceberg.catalog.sql import SqlCatalog
+
+from polars.io.cloud.credential_provider import CredentialProviderIceberg
 from polars.io.iceberg import _credentials as cred
+from polars.io.iceberg._dataset import IcebergCatalogConfig
 
 pytestmark = pytest.mark.write_disk
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+    from pathlib import Path
+
+    from pyiceberg.catalog import Catalog
+    from pyiceberg.table import Table
 
 S3_LOC = "s3://bucket/wh/ns/t/metadata/00001.metadata.json"
 ADLS_LOC = "abfss://c@acct.dfs.core.windows.net/wh/ns/t/metadata/1.metadata.json"
@@ -122,3 +140,223 @@ def test_split_credential_options_without_scheme() -> None:
 )
 def test_vended_expiry(props: dict[str, str], loc: str, expected: int) -> None:
     assert cred.vended_expiry(props, loc, now=1_000_000) == expected
+
+
+@pytest.fixture(autouse=True)
+def _reset_resolver() -> Iterator[None]:
+    yield
+    pl.Config.set_iceberg_catalog_resolver(None)
+
+
+@pytest.fixture(autouse=True)
+def sqlcatalog_uses_null_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    # the default pool keeps sqlite connections open past the test (ResourceWarning)
+    import pyiceberg.catalog.sql as pyiceberg_sql
+    from sqlalchemy.pool import NullPool
+
+    create_engine = pyiceberg_sql.create_engine  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        pyiceberg_sql,
+        "create_engine",
+        lambda url, **kwargs: create_engine(url, **{**kwargs, "poolclass": NullPool}),
+    )
+
+
+class VendingCatalog(SqlCatalog):
+    """A SqlCatalog whose loaded tables carry vended S3 credentials in io.properties."""
+
+    def __init__(
+        self,
+        *args: Any,
+        expires_in_ms: int | None = 3_600_000,
+        with_load_credentials: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.vends = 0
+        self.expires_in_ms = expires_in_ms
+        if with_load_credentials:
+            self.load_credentials = self._load_credentials
+
+    def _vended(self) -> dict[str, str]:
+        self.vends += 1
+        props = {
+            "s3.access-key-id": f"AK{self.vends}",
+            "s3.secret-access-key": "SK",
+            "s3.session-token": f"TOK{self.vends}",
+            "s3.region": "eu-west-1",
+        }
+        if self.expires_in_ms is not None:
+            props["s3.session-token-expires-at-ms"] = str(
+                int(time.time() * 1000) + self.expires_in_ms
+            )
+        return props
+
+    def load_table(self, identifier: Any) -> Table:
+        tbl = super().load_table(identifier)
+        tbl.io.properties.update(self._vended())
+        return tbl
+
+    def _load_credentials(self, identifier: Any, location: str) -> dict[str, str]:
+        self.credential_calls = getattr(self, "credential_calls", 0) + 1
+        self.credential_location = location
+        return self._vended()
+
+
+def new_catalog(
+    tmp_path: Path,
+    name: str,
+    df: pl.DataFrame,
+    catalog_class: type[SqlCatalog] = SqlCatalog,
+    **kwargs: Any,
+) -> SqlCatalog:
+    path = tmp_path / name
+    path.mkdir()
+    catalog = catalog_class(
+        name,
+        uri=f"sqlite:///{path / 'catalog.db'}",
+        warehouse=f"file://{path}",
+        **kwargs,
+    )
+    catalog.create_namespace("ns")
+    table = catalog.create_table(("ns", "t"), schema=df.to_arrow().schema)
+    df.write_iceberg(table, mode="append")
+    return catalog
+
+
+def new_vending_catalog(tmp_path: Path, **kwargs: Any) -> VendingCatalog:
+    catalog = new_catalog(
+        tmp_path, "vending", pl.DataFrame({"a": [1, 2]}), VendingCatalog, **kwargs
+    )
+    assert isinstance(catalog, VendingCatalog)
+    # Table setup above loaded the table; count vends from here.
+    catalog.vends = 0
+    return catalog
+
+
+@pytest.fixture
+def vending(tmp_path: Path) -> VendingCatalog:
+    return new_vending_catalog(tmp_path)
+
+
+@pytest.fixture
+def sales(tmp_path: Path) -> SqlCatalog:
+    return new_catalog(tmp_path, "sales", pl.DataFrame({"a": [1, 2]}))
+
+
+def recording(catalog: Catalog) -> tuple[Callable[[str], Catalog], list[str]]:
+    names: list[str] = []
+
+    def resolve(name: str) -> Catalog:
+        names.append(name)
+        return catalog
+
+    return resolve, names
+
+
+def test_provider_returns_only_credential_keys_and_expiry(
+    vending: VendingCatalog,
+) -> None:
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t"), S3_LOC
+    )
+    creds, expiry = p()
+    assert creds == {
+        "aws_access_key_id": "AK1",
+        "aws_secret_access_key": "SK",
+        "aws_session_token": "TOK1",
+    }
+    assert expiry is not None
+    assert time.time() + 3000 < expiry < time.time() + 3400
+
+
+def test_provider_default_ttl_without_expiry_key(tmp_path: Path) -> None:
+    cat = new_vending_catalog(tmp_path, expires_in_ms=None)
+    # By name: a config would build a new catalog with the default expiry.
+    pl.Config.set_iceberg_catalog_resolver(recording(cat)[0])
+    _, expiry = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)()
+    assert expiry is not None
+    assert time.time() + 850 < expiry <= time.time() + 900
+
+
+def test_provider_prefers_load_credentials(tmp_path: Path) -> None:
+    cat = new_vending_catalog(tmp_path, with_load_credentials=True)
+    # By name, so that the provider calls this instance.
+    pl.Config.set_iceberg_catalog_resolver(recording(cat)[0])
+    p = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)
+    p()
+    assert cat.credential_calls == 1
+    assert cat.credential_location == S3_LOC
+    assert cat.vends == 1
+
+
+def test_provider_falls_back_to_load_table_when_load_credentials_fails(
+    vending: VendingCatalog,
+) -> None:
+    def fail(identifier: Any, location: str) -> dict[str, str]:
+        msg = "no credentials endpoint"
+        raise RuntimeError(msg)
+
+    vending.load_credentials = fail  # type: ignore[attr-defined]
+    pl.Config.set_iceberg_catalog_resolver(recording(vending)[0])
+    creds, _ = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)()
+    assert creds["aws_access_key_id"] == "AK1"
+
+
+def test_provider_resolves_name_through_resolver(vending: VendingCatalog) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    creds, _ = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)()
+    assert names == ["sales"]
+    assert creds["aws_access_key_id"] == "AK1"
+
+
+def test_provider_reuses_catalog_instance_and_refetches_when_cleared(
+    vending: VendingCatalog,
+) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    p = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)
+    p()
+    p.clear_cached_credentials()
+    creds, _ = p()
+    assert names == ["sales"]
+    assert creds["aws_session_token"] == "TOK2"
+
+
+def test_provider_pickles_without_credentials(vending: VendingCatalog) -> None:
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t"), S3_LOC
+    )
+    p()
+    q = pickle.loads(pickle.dumps(p))
+    assert q._cached_credentials.get() is None
+    assert q._catalog_.get() is None
+    assert q.catalog == p.catalog
+    assert q.table_identifier == ("ns", "t")
+    assert pickle.dumps(p) == pickle.dumps(
+        CredentialProviderIceberg(p.catalog, ("ns", "t"), S3_LOC)
+    )
+
+
+def test_provider_raises_when_nothing_vended(sales: SqlCatalog) -> None:
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(sales), ("ns", "t"), S3_LOC
+    )
+    with pytest.raises(ComputeError, match="vended no storage credentials"):
+        p()
+
+
+def test_provider_accepts_local_location(vending: VendingCatalog) -> None:
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending),
+        ("ns", "t"),
+        "file:///x/1.metadata.json",
+    )
+    assert p.scheme is None
+
+
+def test_provider_repr_names_catalog_and_table() -> None:
+    r = repr(CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC))
+    assert "sales" in r
+    assert "ns.t" in r
