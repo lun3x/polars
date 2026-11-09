@@ -1781,8 +1781,10 @@ class Config(contextlib.ContextDecorator, metaclass=_Meta):
         Polars may call the resolver in any process that runs part of a query, at
         any time while building or running it, from several threads at once, and
         more than once for the same name. Polars does not cache catalogs by name,
-        and never serializes a resolved catalog: caching, and refreshing expiring
-        credentials, are up to the resolver.
+        and never serializes a resolved catalog. Polars refreshes vended storage
+        credentials by calling the resolver again, so a resolver must be available
+        in every process that runs part of the query. Caching the catalog object is
+        up to the resolver.
 
         Examples
         --------

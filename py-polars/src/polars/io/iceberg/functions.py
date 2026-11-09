@@ -77,6 +77,12 @@ def scan_iceberg(
         :meth:`Config.set_iceberg_catalog_resolver` where the query runs (by
         default, `pyiceberg.catalog.load_catalog(name)`).
 
+        When the catalog vends storage credentials, the plan carries a credential
+        provider that asks the catalog again when they expire, through the
+        resolver where the plan runs. A scan of a `pyiceberg` `Table` object
+        carries its catalog's configuration, including its properties, in the
+        plan, as a sink's does.
+
         .. warning::
             Passing a catalog name is considered **unstable**. It may be changed
             at any point without it being considered a breaking change.
