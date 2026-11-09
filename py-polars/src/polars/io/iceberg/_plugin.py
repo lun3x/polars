@@ -222,9 +222,15 @@ def plugin_scan(
             provider
         )
         if metadata_cache.enabled:
-            metadata_cache_scope = plugin_storage_scope(
-                tbl.io, user_storage_options, provider_scope=pickle.dumps(provider)
-            )
+            try:
+                provider_scope = pickle.dumps(provider)
+            except Exception:
+                # Providers that cannot be fingerprinted bypass the cache.
+                provider_scope = None
+            if provider_scope is not None:
+                metadata_cache_scope = plugin_storage_scope(
+                    tbl.io, user_storage_options, provider_scope=provider_scope
+                )
     else:
         credential_provider = _init_credential_provider_builder(
             "auto", metadata_location, storage_options, "scan_iceberg"

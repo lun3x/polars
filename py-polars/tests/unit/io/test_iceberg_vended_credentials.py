@@ -950,6 +950,32 @@ def test_plugin_scan_passes_vended_credential_provider(
     assert seen["metadata_cache_scope"] is not None
 
 
+def test_plugin_scan_unpicklable_provider_bypasses_metadata_cache(
+    monkeypatch: pytest.MonkeyPatch, vending: VendingCatalog
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    import polars._plr as plr
+
+    seen: dict[str, Any] = {}
+    real_plugin_scan = plr._iceberg_plugin_scan
+
+    def recording_plugin_scan(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_plugin_scan(*args, **kwargs)
+
+    monkeypatch.setattr(plr, "_iceberg_plugin_scan", recording_plugin_scan)
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "plugin")
+
+    tbl = vending.load_table(("ns", "t"))
+    # The provider carries the catalog's config, which cannot be pickled.
+    vending.properties["unpicklable"] = lambda: None  # type: ignore[assignment]
+    df = pl.scan_iceberg(tbl).collect()
+
+    assert df.to_dict(as_series=False) == {"a": [1, 2]}
+    assert seen["credential_provider"] is not None
+    assert seen["metadata_cache_scope"] is None
+
+
 def test_plugin_storage_scope_ignores_credential_values(
     vending: VendingCatalog,
 ) -> None:
