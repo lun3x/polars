@@ -13,9 +13,16 @@ pytest.importorskip("pyiceberg.catalog.sql")
 
 from pyiceberg.catalog.sql import SqlCatalog
 
+from polars.io.cloud._utils import NoPickleOption
 from polars.io.cloud.credential_provider import CredentialProviderIceberg
 from polars.io.iceberg import _credentials as cred
-from polars.io.iceberg._dataset import IcebergCatalogConfig
+from polars.io.iceberg._dataset import (
+    IcebergCatalogConfig,
+    IcebergCatalogTableDescriptor,
+    IcebergLoadedTableState,
+    IcebergScanTableSerializer,
+    IcebergTableWrap,
+)
 
 pytestmark = pytest.mark.write_disk
 
@@ -451,3 +458,167 @@ def test_catalog_credentials_unsupported_property_policy() -> None:
         on_unsupported="user_options",
     )
     assert (static, provider) == ({"aws_region": "us-east-1"}, None)
+
+
+def wrap_for_name(name: str, identifier: str = "ns.t") -> IcebergTableWrap:
+    return IcebergTableWrap(
+        table_=NoPickleOption(None),
+        table_descriptor_=IcebergCatalogTableDescriptor(
+            table_identifier=identifier, catalog_config=name
+        ),
+        serializer=IcebergScanTableSerializer(),
+        iceberg_storage_properties=None,
+    )
+
+
+def wrap_for_table(tbl: Table) -> IcebergTableWrap:
+    return IcebergTableWrap(
+        table_=NoPickleOption(tbl),
+        table_descriptor_=None,
+        serializer=IcebergScanTableSerializer(),
+        iceberg_storage_properties=None,
+    )
+
+
+def roundtrip(wrap: IcebergTableWrap) -> IcebergTableWrap:
+    return pickle.loads(pickle.dumps(wrap))  # type: ignore[no-any-return]
+
+
+def test_loaded_state_from_descriptor_scan(vending: VendingCatalog) -> None:
+    resolver, _ = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    wrap = wrap_for_name("sales")
+    wrap.get()  # loads the table
+    state = roundtrip(wrap).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.catalog == "sales"
+    assert state.table_identifier == ("ns", "t")
+    assert state.vended is True
+    assert state.metadata_location.endswith(".metadata.json")
+
+
+def test_loaded_state_from_table_object_carries_catalog_config(
+    vending: VendingCatalog,
+) -> None:
+    tbl = vending.load_table(("ns", "t"))
+    state = roundtrip(wrap_for_table(tbl)).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.catalog == IcebergCatalogConfig.from_catalog(vending)
+    assert state.vended is True
+
+
+def test_loaded_state_static_table_has_no_source(sales: SqlCatalog) -> None:
+    from pyiceberg.table import StaticTable
+
+    tbl = StaticTable.from_metadata(sales.load_table(("ns", "t")).metadata_location)
+    state = roundtrip(wrap_for_table(tbl)).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.catalog is None
+    assert state.vended is False
+
+
+def test_loaded_state_glue_like_is_not_vended(sales: SqlCatalog) -> None:
+    state = roundtrip(wrap_for_table(sales.load_table(("ns", "t")))).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.vended is False
+    assert state.catalog == IcebergCatalogConfig.from_catalog(sales)
+
+
+def test_get_on_vended_state_fetches_then_loads_from_metadata_location(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    loaded = wrap_for_name("sales")
+    loaded.get()
+    wrap = roundtrip(loaded)
+    loads: list[Any] = []
+
+    def load_table(ident: Any) -> Table:
+        loads.append(ident)
+        return VendingCatalog.load_table(vending, ident)
+
+    monkeypatch.setattr(vending, "load_table", load_table)
+    names.clear()
+    tbl = wrap.get()
+    state = wrap.table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    # The resolver is called for credentials, and the table loaded only for them
+    # (this catalog has no `load_credentials`).
+    assert names == ["sales"]
+    assert loads == [("ns", "t")]
+    # The pinned snapshot.
+    assert tbl.metadata_location == state.metadata_location
+    assert tbl.io.properties["s3.access-key-id"].startswith("AK")
+
+
+def test_get_on_vended_state_surfaces_refusing_resolver(
+    vending: VendingCatalog,
+) -> None:
+    resolver, _ = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    loaded = wrap_for_name("sales")
+    loaded.get()
+    wrap = roundtrip(loaded)
+
+    def refuse(name: str) -> Catalog:
+        msg = f'catalog "{name}" refused'
+        raise ComputeError(msg)
+
+    pl.Config.set_iceberg_catalog_resolver(refuse)
+    with pytest.raises(ComputeError, match='catalog "sales" refused'):
+        wrap.get()
+
+
+def test_old_str_state_still_loads(sales: SqlCatalog) -> None:
+    tbl = sales.load_table(("ns", "t"))
+    wrap = IcebergTableWrap(
+        table_=NoPickleOption(None),
+        table_descriptor_=tbl.metadata_location,
+        serializer=IcebergScanTableSerializer(),
+        iceberg_storage_properties=None,
+    )
+    assert wrap.get().metadata_location == tbl.metadata_location
+
+
+def test_loaded_state_survives_a_second_roundtrip(vending: VendingCatalog) -> None:
+    pl.Config.set_iceberg_catalog_resolver(recording(vending)[0])
+    loaded = wrap_for_name("sales")
+    loaded.get()
+    wrap = roundtrip(loaded)
+    wrap.get()
+    state = roundtrip(wrap).loaded_state()
+    assert state == wrap.loaded_state()
+    assert state is not None
+    assert state.catalog == "sales"
+
+
+def test_catalog_source() -> None:
+    assert wrap_for_name("sales").catalog_source() == ("sales", ("ns", "t"))
+
+
+@pytest.mark.parametrize(
+    ("creds", "scheme", "expected"),
+    [
+        (
+            {"aws_access_key_id": "k", "aws_secret_access_key": "s"},
+            "aws",
+            {"s3.access-key-id": "k", "s3.secret-access-key": "s"},
+        ),
+        ({"aws_session_token": "t"}, None, {"s3.session-token": "t"}),
+        ({"sas_token": "sig"}, "azure", {"adls.sas-token": "sig"}),
+        ({"account_key": "a"}, "azure", {"adls.account-key": "a"}),
+        ({"bearer_token": "b"}, "azure", {"adls.token": "b"}),
+        ({"bearer_token": "b"}, "gcp", {"gcs.oauth2.token": "b"}),
+        ({"bearer_token": "b"}, None, {"gcs.oauth2.token": "b"}),
+        (
+            {"bearer_token": "b", "sas_token": "sig"},
+            None,
+            {"adls.token": "b", "adls.sas-token": "sig"},
+        ),
+    ],
+)
+def test_provider_credentials_to_iceberg_properties(
+    creds: dict[str, str], scheme: cred.CloudScheme | None, expected: dict[str, str]
+) -> None:
+    assert cred.provider_credentials_to_iceberg_properties(creds, scheme) == expected

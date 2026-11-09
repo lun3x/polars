@@ -345,6 +345,43 @@ def split_credential_options(
     return static, credentials
 
 
+# Credential provider keys → Iceberg FileIO properties (the inverse of
+# `catalog_storage_options` and `split_credential_options` for credentials).
+# `bearer_token` depends on the cloud.
+_PROVIDER_KEY_TO_ICEBERG_PROPERTY = {
+    "aws_access_key_id": "s3.access-key-id",
+    "aws_secret_access_key": "s3.secret-access-key",
+    "aws_session_token": "s3.session-token",
+    "account_key": "adls.account-key",
+    "sas_token": "adls.sas-token",
+}
+
+
+def provider_credentials_to_iceberg_properties(
+    credentials: Mapping[str, str], scheme: CloudScheme | None
+) -> dict[str, str]:
+    """
+    Iceberg FileIO properties for credentials a credential provider returned.
+
+    A bearer token is an ADLS token for `"azure"`, and a GCS token for `"gcp"`, or
+    for `None` when no Azure credential is present.
+    """
+    if scheme == "azure" or (
+        scheme is None and ("account_key" in credentials or "sas_token" in credentials)
+    ):
+        bearer_token_property = "adls.token"
+    else:
+        bearer_token_property = "gcs.oauth2.token"
+
+    properties: dict[str, str] = {}
+    for k, v in credentials.items():
+        if k == "bearer_token":
+            properties[bearer_token_property] = v
+        elif k in _PROVIDER_KEY_TO_ICEBERG_PROPERTY:
+            properties[_PROVIDER_KEY_TO_ICEBERG_PROPERTY[k]] = v
+    return properties
+
+
 def catalog_credentials(
     *,
     catalog: CatalogSource | None,
