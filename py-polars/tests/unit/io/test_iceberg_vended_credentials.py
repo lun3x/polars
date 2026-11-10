@@ -400,6 +400,11 @@ VENDED = {
     "s3.region": "eu-west-1",
 }
 GLUE = {"s3.region": "eu-west-1"}
+# Static keys in a catalog's own configuration, as catalog properties.
+CONFIGURED_KEYS: dict[str, Any] = {
+    "s3.access-key-id": "AK",
+    "s3.secret-access-key": "SK",
+}
 
 
 def test_catalog_credentials_engages_provider() -> None:
@@ -754,10 +759,7 @@ def test_loaded_state_configured_keys_are_not_vended(
     tmp_path: Path, vending: VendingCatalog
 ) -> None:
     sales = new_catalog(
-        tmp_path,
-        "configured",
-        pl.DataFrame({"a": [1]}),
-        **{"s3.access-key-id": "AK", "s3.secret-access-key": "SK"},
+        tmp_path, "configured", pl.DataFrame({"a": [1]}), **CONFIGURED_KEYS
     )
     tbl = sales.load_table(("ns", "t"))
     assert tbl.io.properties["s3.access-key-id"] == "AK"
@@ -765,9 +767,11 @@ def test_loaded_state_configured_keys_are_not_vended(
     assert isinstance(state, IcebergLoadedTableState)
     assert state.vended is False
 
-    state = roundtrip(wrap_for_table(vending.load_table(("ns", "t"))))
-    assert isinstance(state.table_descriptor_, IcebergLoadedTableState)
-    assert state.table_descriptor_.vended is True
+    vended_state = roundtrip(
+        wrap_for_table(vending.load_table(("ns", "t")))
+    ).table_descriptor_
+    assert isinstance(vended_state, IcebergLoadedTableState)
+    assert vended_state.vended is True
 
 
 def test_plugin_scan_configured_keys_engage_no_provider(
@@ -777,13 +781,10 @@ def test_plugin_scan_configured_keys_engage_no_provider(
     from polars.io.iceberg import _plugin
 
     sales = new_catalog(
-        tmp_path,
-        "configured",
-        pl.DataFrame({"a": [1]}),
-        **{"s3.access-key-id": "AK", "s3.secret-access-key": "SK"},
+        tmp_path, "configured", pl.DataFrame({"a": [1]}), **CONFIGURED_KEYS
     )
     seen: dict[str, Any] = {}
-    real = _plugin.catalog_credentials
+    real = cred.catalog_credentials
 
     def recording_catalog_credentials(**kwargs: Any) -> Any:
         seen.update(kwargs)
@@ -1393,7 +1394,7 @@ def test_sink_reuses_table_catalog_for_credentials(
     from polars.io.iceberg import _sink
 
     seen: list[tuple[Any, Any]] = []
-    real = _sink.catalog_credentials
+    real = cred.catalog_credentials
 
     def spy(**kw: Any) -> Any:
         out = real(**kw)
@@ -1511,16 +1512,17 @@ def test_refresh_end_to_end_on_s3(
         aws_secret_access_key="y",
     ).create_bucket(Bucket="bucket")
 
+    s3_properties: dict[str, Any] = {
+        "s3.endpoint": s3_base,
+        "s3.access-key-id": "x",
+        "s3.secret-access-key": "y",
+        "s3.region": "us-east-1",
+    }
     cat = VendingCatalog(
         "sales",
         uri=f"sqlite:///{tmp_path}/c.db",
         warehouse="s3://bucket/wh",
-        **{
-            "s3.endpoint": s3_base,
-            "s3.access-key-id": "x",
-            "s3.secret-access-key": "y",
-            "s3.region": "us-east-1",
-        },
+        **s3_properties,
     )
     cat.create_namespace("ns")
     tbl = cat.create_table(
