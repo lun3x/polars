@@ -672,7 +672,7 @@ class CredentialProviderIceberg(CachingCredentialProvider):
         from polars.exceptions import ComputeError
         from polars.io.iceberg._catalog_resolver import catalog_from
         from polars.io.iceberg._credentials import (
-            catalog_storage_options,
+            credential_storage_options,
             fetch_vended_properties,
             split_credential_options,
             vended_expiry,
@@ -686,7 +686,7 @@ class CredentialProviderIceberg(CachingCredentialProvider):
         properties = fetch_vended_properties(
             catalog, self.table_identifier, self.location
         )
-        options = catalog_storage_options(properties, self.location, all_backends=True)
+        options = credential_storage_options(properties, self.location)
         _, credentials = split_credential_options(options, self.scheme)
 
         if not credentials:

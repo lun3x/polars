@@ -187,8 +187,7 @@ def catalog_storage_options(
     Object store options from a table's FileIO properties.
 
     Only properties of `location`'s backend apply, or with `all_backends`, those of
-    every backend: to find the credentials a catalog vended for a location outside
-    the clouds (e.g. a local warehouse in tests).
+    every backend (see `credential_storage_options`).
 
     Raises `NotImplementedError` for properties that change how storage is accessed
     but have no equivalent, so that PyIceberg plans the scan.
@@ -241,6 +240,41 @@ def catalog_storage_options(
         if scheme in schemes and _property_is_true(properties, anonymous_key):
             storage_options[skip_signature_key] = "true"
     return storage_options
+
+
+def credential_storage_options(
+    properties: Mapping[str, Any], location: str
+) -> dict[str, Any]:
+    """
+    Object store options in which to look for credentials vended for `location`.
+
+    As `catalog_storage_options`: only the properties of `location`'s backend, so a
+    provider is attached only for credentials vended for the files' own backend.
+    For a local location (e.g. a local warehouse in tests), those of every backend.
+    """
+    return catalog_storage_options(
+        properties, location, all_backends=_is_local(location)
+    )
+
+
+def _is_local(location: str) -> bool:
+    return _url_scheme(location) in ("", "file")
+
+
+def native_credential_location(
+    table: pyiceberg.table.Table, source: str | None = None
+) -> str:
+    """
+    `native_location`, for a credential provider.
+
+    The table's data path ends in `/`, so that it matches the prefixes catalogs vend
+    credentials for (e.g. PyIceberg's `load_credentials` matches by
+    `location.startswith(prefix)`); a source file is left as is.
+    """
+    location = native_location(table, source)
+    if location == source:
+        return location
+    return location.rstrip("/") + "/"
 
 
 def _backend(location: str) -> tuple[str, ...] | None:
@@ -384,9 +418,7 @@ def split_vended_options(
     the catalog vends into the table's FileIO properties, not the catalog's.
     """
     try:
-        configured = catalog_storage_options(
-            configured_properties or {}, location, all_backends=True
-        )
+        configured = credential_storage_options(configured_properties or {}, location)
     except NotImplementedError:
         configured = {}
     configured_keys = {
@@ -528,7 +560,7 @@ def _vended_credential_keys(
     clouds, whose values differ from the catalog's own configuration
     (`configured_properties`).
     """
-    options = catalog_storage_options(properties, location, all_backends=True)
+    options = credential_storage_options(properties, location)
     static, _ = split_vended_options(options, configured_properties, location)
     return frozenset(options.keys() - static.keys())
 
@@ -575,7 +607,7 @@ def fetch_vended_properties(
 def _has_credentials(properties: Mapping[str, Any], location: str) -> bool:
     """Whether FileIO `properties` hold credentials for `location`."""
     try:
-        options = catalog_storage_options(properties, location, all_backends=True)
+        options = credential_storage_options(properties, location)
     except NotImplementedError:
         # Not for the fallback to decide; the caller raises.
         return True

@@ -215,6 +215,13 @@ class VendingCatalog(SqlCatalog):
         return self._vended()
 
 
+class LoadCredentialsCatalog(VendingCatalog):
+    """A `VendingCatalog` with `load_credentials`, also when built from its config."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, with_load_credentials=True, **kwargs)
+
+
 def new_catalog(
     tmp_path: Path,
     name: str,
@@ -673,6 +680,52 @@ def test_catalog_credentials_static_half_is_native_storage_options(
         # In the same order, as of two aliases the later one wins.
         assert static is not None
         assert list(static) == [k for k in native if k in static]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("hf://datasets/x/f.parquet", {"token": "x"}),
+        ("https://example.com/f.parquet", {}),
+    ],
+)
+def test_catalog_credentials_non_cloud_source_of_vending_table(
+    source: str, expected: dict[str, Any]
+) -> None:
+    from polars.io.iceberg._plugin import _native_storage_options
+
+    # A file on a non-cloud remote backend, of a table whose catalog vends S3
+    # credentials: those are not for that file, so upstream's options, no provider.
+    properties = {**VENDED, "hf.token": "x"}
+    table = NativeTable(properties, "s3://bucket/wh/ns/t")
+    location = cred.native_credential_location(table, source)  # type: ignore[arg-type]
+    assert location == source
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=location,
+        catalog_properties=properties,
+        user_storage_options=None,
+        on_unsupported="user_options",
+        configured_properties={},
+    )
+    assert provider is None
+    assert static == _native_storage_options(table, None, source) == expected  # type: ignore[arg-type]
+    assert not cred._has_credentials(properties, source)
+
+
+def test_native_credential_location_ends_in_slash() -> None:
+    table = NativeTable({}, "s3://bucket/wh/ns/t")
+    assert cred.native_credential_location(table) == "s3://bucket/wh/ns/t/"  # type: ignore[arg-type]
+    table = NativeTable({}, "s3://bucket/wh/ns/t/", {"write.data.path": "s3://b/d/"})
+    assert cred.native_credential_location(table) == "s3://b/d/"  # type: ignore[arg-type]
+    # A source file on the same backend: the data path.
+    assert cred.native_credential_location(table, "s3://b/d/f.parquet") == "s3://b/d/"  # type: ignore[arg-type]
+    # On another backend: the file itself.
+    assert (
+        cred.native_credential_location(table, "gs://b/f.parquet")  # type: ignore[arg-type]
+        == "gs://b/f.parquet"
+    )
 
 
 def wrap_for_name(name: str, identifier: str = "ns.t") -> IcebergTableWrap:
@@ -1468,6 +1521,51 @@ def test_sink_staged_create_engages_no_provider(
         pl.scan_iceberg(vending.load_table(("ns", "t2"))).collect(),
         pl.DataFrame({"a": [3]}),
     )
+
+
+def test_native_scan_provider_asks_for_slash_terminated_data_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    vending = new_vending_catalog(tmp_path, with_load_credentials=True)
+    tbl = vending.load_table(("ns", "t"))
+    scan_data = new_iceberg_scan_resolver(tbl)._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    provider = scan_data.credential_provider
+    assert isinstance(provider, CredentialProviderIceberg)
+    provider()
+    assert vending.credential_location == tbl.location().rstrip("/") + "/"
+
+
+def test_sink_provider_asks_for_slash_terminated_data_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from polars.io.iceberg import _sink
+
+    vending = new_catalog(
+        tmp_path,
+        "vending",
+        pl.DataFrame({"a": [1, 2]}),
+        LoadCredentialsCatalog,
+    )
+    providers: list[CredentialProviderIceberg] = []
+    real = cred.catalog_credentials
+
+    def spy(**kw: Any) -> Any:
+        out = real(**kw)
+        if out[1] is not None:
+            providers.append(out[1])
+        return out
+
+    monkeypatch.setattr(_sink, "catalog_credentials", spy)
+    pl.DataFrame({"a": [3]}).lazy().sink_iceberg("ns.t", catalog=vending, mode="append")
+    assert providers
+    providers[0]()
+    # The sink's catalog, rebuilt from its config where the plan runs.
+    catalog = providers[0]._catalog_.get()
+    assert isinstance(catalog, LoadCredentialsCatalog)
+    location = vending.load_table(("ns", "t")).location()
+    assert catalog.credential_location == location.rstrip("/") + "/"
 
 
 @pytest.fixture(scope="module")

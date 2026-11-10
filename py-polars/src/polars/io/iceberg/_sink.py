@@ -15,7 +15,10 @@ from polars._utils.wrap import wrap_ldf
 from polars.exceptions import ComputeError
 from polars.io.cloud._utils import NoPickleOption
 from polars.io.iceberg._catalog_resolver import check_catalog_name, resolve_catalog
-from polars.io.iceberg._credentials import catalog_credentials, native_location
+from polars.io.iceberg._credentials import (
+    catalog_credentials,
+    native_credential_location,
+)
 from polars.io.iceberg._dataset import (
     IcebergCatalogConfig,
 )
@@ -1568,7 +1571,7 @@ class IcebergSinkState:
             static_options, provider = catalog_credentials(
                 catalog=self.catalog_source(),
                 table_identifier=tuple(table.name()),
-                location=native_location(table),
+                location=native_credential_location(table),
                 catalog_properties=table.io.properties,
                 user_storage_options=self.iceberg_storage_properties,
                 on_unsupported="user_options",

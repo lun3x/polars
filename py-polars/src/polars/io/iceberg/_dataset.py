@@ -81,7 +81,7 @@ class IcebergScanTableSerializer(IcebergTableSerializer):
         `descriptor` is the one the table was loaded from, if any.
         """
         from polars.io.iceberg._credentials import (
-            catalog_storage_options,
+            credential_storage_options,
             split_vended_options,
         )
 
@@ -94,9 +94,7 @@ class IcebergScanTableSerializer(IcebergTableSerializer):
         try:
             vended = bool(
                 split_vended_options(
-                    catalog_storage_options(
-                        table.io.properties, location, all_backends=True
-                    ),
+                    credential_storage_options(table.io.properties, location),
                     table.catalog.properties,
                     location,
                 )[1]
@@ -488,13 +486,13 @@ class IcebergScanResolver:
         at `source`, on another backend). Vended credentials are refreshed by a
         provider, and left out of the options, when the table's catalog is known.
         """
-        from polars.io.iceberg._credentials import native_location
+        from polars.io.iceberg._credentials import native_credential_location
 
         catalog, table_identifier = self.table.catalog_source()
         return catalog_credentials(
             catalog=catalog,
             table_identifier=table_identifier,
-            location=native_location(tbl, source),
+            location=native_credential_location(tbl, source),
             catalog_properties=tbl.io.properties,
             user_storage_options=self.table.iceberg_storage_properties,
             on_unsupported="user_options",
