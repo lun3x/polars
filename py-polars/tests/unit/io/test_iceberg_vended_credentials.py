@@ -479,6 +479,7 @@ def test_catalog_credentials_user_credentials_win() -> None:
         user_storage_options={"aws_profile": "me"},
     )
     assert provider is None
+    assert static is not None
     assert "aws_access_key_id" not in static
     assert static["aws_profile"] == "me"
 
@@ -503,6 +504,7 @@ def test_catalog_credentials_no_source_keeps_static_keys() -> None:
         user_storage_options=None,
     )
     assert provider is None
+    assert static is not None
     assert static["aws_access_key_id"] == "AK"
 
 
@@ -576,6 +578,96 @@ def test_catalog_credentials_without_configured_properties() -> None:
     )
     assert static == {"aws_region": "eu-west-1"}
     assert isinstance(provider, CredentialProviderIceberg)
+
+
+class NativeTable:
+    """What `_native_storage_options` and `native_location` read of a table."""
+
+    def __init__(
+        self,
+        properties: dict[str, Any],
+        location: str,
+        table_properties: dict[str, str] | None = None,
+    ) -> None:
+        self.io = type("IO", (), {"properties": properties})()
+        self._location = location
+        self.properties = table_properties or {}
+
+    def location(self) -> str:
+        return self._location
+
+
+_AWS_CREDENTIALS = {"aws_access_key_id", "aws_secret_access_key", "aws_session_token"}
+
+
+@pytest.mark.parametrize(
+    ("properties", "configured", "location", "user", "vended"),
+    [
+        # Vended, with another backend's properties, which don't apply.
+        (
+            {**VENDED, "adls.account-name": "a", "s3.endpoint": "http://e"},
+            {},
+            "s3://bucket/wh/ns/t",
+            None,
+            True,
+        ),
+        # Vended, with the user's non-credential options last, in their order.
+        (
+            VENDED,
+            {},
+            "s3://bucket/wh/ns/t",
+            {"aws_endpoint": "first", "aws_endpoint_url": "last", "s3.region": ""},
+            True,
+        ),
+        # Configured on the catalog (e.g. static keys): not vended.
+        (VENDED, VENDED, "s3://bucket/wh/ns/t", None, False),
+        # Glue-like: nothing vended.
+        (GLUE, {}, "s3://bucket/wh/ns/t", {"aws_endpoint": "e"}, False),
+        # The user's credentials replace the catalog's.
+        (VENDED, {}, "s3://bucket/wh/ns/t", {"aws_profile": "p"}, False),
+        # No object store equivalent: the user's options alone, or none.
+        ({**VENDED, "s3.role-arn": "arn"}, {}, "s3://bucket/wh/ns/t", None, False),
+        (
+            {**VENDED, "s3.role-arn": "arn"},
+            {},
+            "s3://bucket/wh/ns/t",
+            {"s3.region": "us-east-1"},
+            False,
+        ),
+        # A local table: S3 properties don't apply, but are vended.
+        (VENDED, {}, "file:///tmp/wh/ns/t", None, True),
+    ],
+)
+def test_catalog_credentials_static_half_is_native_storage_options(
+    properties: dict[str, Any],
+    configured: dict[str, Any],
+    location: str,
+    user: dict[str, Any] | None,
+    vended: bool,
+) -> None:
+    from polars.io.iceberg._plugin import _native_storage_options
+
+    table = NativeTable(properties, location)
+    native = _native_storage_options(table, user)  # type: ignore[arg-type]
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=cred.native_location(table),  # type: ignore[arg-type]
+        catalog_properties=properties,
+        user_storage_options=user,
+        on_unsupported="user_options",
+        configured_properties=configured,
+    )
+    assert isinstance(provider, CredentialProviderIceberg) is vended
+    if native is None:
+        assert static is None
+    else:
+        assert static == {
+            k: v for k, v in native.items() if not (vended and k in _AWS_CREDENTIALS)
+        }
+        # In the same order, as of two aliases the later one wins.
+        assert static is not None
+        assert list(static) == [k for k in native if k in static]
 
 
 def wrap_for_name(name: str, identifier: str = "ns.t") -> IcebergTableWrap:
@@ -705,7 +797,8 @@ def test_plugin_scan_configured_keys_engage_no_provider(
     assert seen["configured_properties"] is tbl.catalog.properties
     static, provider = seen["result"]
     assert provider is None
-    assert static["aws_access_key_id"] == "AK"
+    # As without vending: S3 properties don't apply to a local table.
+    assert static == {}
 
 
 def test_get_on_vended_state_fetches_then_loads_from_metadata_location(
@@ -1060,7 +1153,9 @@ def test_native_scan_glue_role_arn_keeps_ambient_credentials(
     tbl.io.properties["s3.role-arn"] = "arn:aws:iam::1:role/r"
     scan_data = new_iceberg_scan_resolver(tbl)._to_dataset_scan_impl()
     assert isinstance(scan_data, _NativeIcebergScanData)
-    assert scan_data.storage_options is None
+    # The table's FileIO properties, as without vending: S3 properties don't apply
+    # to a local table.
+    assert scan_data.storage_options == {}
     assert scan_data.credential_provider is None
     assert_frame_equal(scan_data.to_lazyframe().collect(), pl.DataFrame({"a": [1, 2]}))
 
@@ -1073,7 +1168,8 @@ def test_native_scan_without_vending_unchanged(
         sales.load_table(("ns", "t"))
     )._to_dataset_scan_impl()
     assert isinstance(scan_data, _NativeIcebergScanData)
-    assert scan_data.storage_options is None
+    # The table's FileIO properties, as `_native_storage_options` gives them.
+    assert scan_data.storage_options == {}
     assert scan_data.credential_provider is None
 
 

@@ -653,7 +653,8 @@ class CredentialProviderIceberg(CachingCredentialProvider):
         table_identifier
             The table's identifier in the catalog.
         location
-            The table's metadata location, which selects the credentials.
+            A location of the table's files (e.g. its metadata location or data
+            path), which selects the credentials.
         """
         from polars.io.iceberg._credentials import cloud_scheme
 
@@ -685,7 +686,7 @@ class CredentialProviderIceberg(CachingCredentialProvider):
         properties = fetch_vended_properties(
             catalog, self.table_identifier, self.location
         )
-        options = catalog_storage_options(properties, self.location)
+        options = catalog_storage_options(properties, self.location, all_backends=True)
         _, credentials = split_credential_options(options, self.scheme)
 
         if not credentials:

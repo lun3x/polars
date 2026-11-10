@@ -23,7 +23,6 @@ from polars.io.iceberg._catalog_resolver import catalog_from
 from polars.io.iceberg._credentials import catalog_credentials
 from polars.io.iceberg._plugin import (
     _is_credential_key,
-    _native_storage_options,
     plugin_planner_required,
     plugin_scan,
     use_plugin_planner,
@@ -95,7 +94,9 @@ class IcebergScanTableSerializer(IcebergTableSerializer):
         try:
             vended = bool(
                 split_vended_options(
-                    catalog_storage_options(table.io.properties, location),
+                    catalog_storage_options(
+                        table.io.properties, location, all_backends=True
+                    ),
                     table.catalog.properties,
                     location,
                 )[1]
@@ -477,23 +478,23 @@ class IcebergScanResolver:
     file_tasks: list[FileScanTask] | None = field(default=None, repr=False)
 
     def _catalog_credentials(
-        self, tbl: pyiceberg.table.Table
-    ) -> tuple[StorageOptionsDict, CredentialProviderIceberg | None]:
+        self, tbl: pyiceberg.table.Table, source: str | None = None
+    ) -> tuple[StorageOptionsDict | None, CredentialProviderIceberg | None]:
         """
-        Object store options for `tbl`, and a provider of its vended credentials.
+        Object store options for `tbl`'s files, and a provider of vended credentials.
 
-        Vended credentials are refreshed by a provider when the table's catalog is
-        known. Otherwise the user's options apply as before, and credentials are
-        resolved by the reader (e.g. ambient ones).
+        The options are the table's FileIO properties and the user's, as
+        `_native_storage_options` gives them for files at the table's data path (or
+        at `source`, on another backend). Vended credentials are refreshed by a
+        provider, and left out of the options, when the table's catalog is known.
         """
-        # Optional in REST catalog responses, despite the annotation.
-        if tbl.metadata_location is None:
-            return {}, None
+        from polars.io.iceberg._credentials import native_location
+
         catalog, table_identifier = self.table.catalog_source()
         return catalog_credentials(
             catalog=catalog,
             table_identifier=table_identifier,
-            location=tbl.metadata_location,
+            location=native_location(tbl, source),
             catalog_properties=tbl.io.properties,
             user_storage_options=self.table.iceberg_storage_properties,
             on_unsupported="user_options",
@@ -1070,21 +1071,12 @@ class IcebergScanResolver:
                 else None
             )
 
-            # Vended credentials are refreshed by a provider when the table's
-            # catalog is known. Otherwise the table's FileIO properties apply, as
-            # for the plugin's scans.
-            static_options, credential_provider = self._catalog_credentials(tbl)
-
-            storage_options: StorageOptionsDict | None
-            if credential_provider is not None:
-                storage_options = static_options
-            else:
-                # The table's FileIO properties, as for the plugin's scans
-                storage_options = _native_storage_options(
-                    tbl,
-                    self.table.iceberg_storage_properties,
-                    sources[0] if sources else None,
-                )
+            # The table's FileIO properties, as for the plugin's scans; vended
+            # credentials are refreshed by a provider when the table's catalog is
+            # known.
+            storage_options, credential_provider = self._catalog_credentials(
+                tbl, sources[0] if sources else None
+            )
 
             return _NativeIcebergScanData(
                 sources=sources,

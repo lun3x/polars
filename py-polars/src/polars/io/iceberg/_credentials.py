@@ -18,13 +18,12 @@ if TYPE_CHECKING:
     from typing import TypeAlias
 
     import pyiceberg.catalog
+    import pyiceberg.table
 
     from polars.io.cloud.credential_provider._providers import (
         CredentialProviderIceberg,
     )
     from polars.io.iceberg._dataset import IcebergCatalogConfig
-
-    import pyiceberg.table
 
 CloudScheme = Literal["aws", "azure", "gcp"]
 
@@ -155,11 +154,7 @@ def _native_storage_options(
     (a file to read) if that is on another backend. With FileIO properties that
     have no object store equivalent, the user's storage options alone.
     """
-    # Where the table writes its data files: stable across scans, unlike a file.
-    location = table.properties.get("write.data.path") or table.location()
-    # Files on another backend (e.g. added from elsewhere) take its properties.
-    if source is not None and _backend(source) != _backend(location):
-        location = source
+    location = native_location(table, source)
     try:
         return _storage_options(table.io.properties, location, user_storage_options)
     except NotImplementedError as e:
@@ -170,11 +165,30 @@ def _native_storage_options(
         return _user_storage_options(user_storage_options)
 
 
+def native_location(table: pyiceberg.table.Table, source: str | None = None) -> str:
+    """
+    Where Polars' own reads and writes of `table`'s files are.
+
+    The table's data path, or `source` (a file to read) if that is on another
+    backend.
+    """
+    # Where the table writes its data files: stable across scans, unlike a file.
+    location = table.properties.get("write.data.path") or table.location()
+    # Files on another backend (e.g. added from elsewhere) take its properties.
+    if source is not None and _backend(source) != _backend(location):
+        location = source
+    return location
+
+
 def catalog_storage_options(
-    properties: Mapping[str, Any], location: str
+    properties: Mapping[str, Any], location: str, *, all_backends: bool = False
 ) -> dict[str, Any]:
     """
     Object store options from a table's FileIO properties.
+
+    Only properties of `location`'s backend apply, or with `all_backends`, those of
+    every backend: to find the credentials a catalog vended for a location outside
+    the clouds (e.g. a local warehouse in tests).
 
     Raises `NotImplementedError` for properties that change how storage is accessed
     but have no equivalent, so that PyIceberg plans the scan.
@@ -189,7 +203,7 @@ def catalog_storage_options(
     properties = {
         k: v
         for k, v in properties.items()
-        if v not in ("", None) and _configures(k, scheme)
+        if v not in ("", None) and (all_backends or _configures(k, scheme))
     }
     if (host := adls_account_host(location)) is not None:
         properties = _select_adls_account_properties(properties, host)
@@ -370,7 +384,9 @@ def split_vended_options(
     the catalog vends into the table's FileIO properties, not the catalog's.
     """
     try:
-        configured = catalog_storage_options(configured_properties or {}, location)
+        configured = catalog_storage_options(
+            configured_properties or {}, location, all_backends=True
+        )
     except NotImplementedError:
         configured = {}
     configured_keys = {
@@ -427,21 +443,24 @@ def catalog_credentials(
     on_unsupported: Literal["raise", "user_options"] = "raise",
     configured_properties: Mapping[str, Any] | None = None,
     live_catalog: pyiceberg.catalog.Catalog | None = None,
-) -> tuple[dict[str, Any], CredentialProviderIceberg | None]:
+) -> tuple[dict[str, Any] | None, CredentialProviderIceberg | None]:
     """
     Object store options for a table, and a provider of its vended credentials.
 
-    The catalog's options are overridden by the user's; the user's credentials
-    replace the catalog's as a whole. Vended credentials are refreshed by a
+    The options are those of `_storage_options`: the table's FileIO properties for
+    `location`'s backend, overridden by the user's; the user's credentials replace
+    the catalog's as a whole. Vended credentials are refreshed by a
     `CredentialProviderIceberg` (and left out of the options) when the user gave
-    none and the catalog and table are known; otherwise the provider is `None`.
+    none and the catalog and table are known; otherwise the provider is `None`, and
+    the options are exactly `_storage_options`'.
 
     Credentials with the value the catalog's own configuration
     (`configured_properties`, e.g. `catalog.properties`) gives were not vended, and
     stay in the options.
 
     Properties without an object store equivalent raise `NotImplementedError`, or
-    with `on_unsupported="user_options"`, yield only the user's options.
+    with `on_unsupported="user_options"`, yield only the user's options (`None`
+    without any), as `_native_storage_options`.
 
     The provider fetches through `live_catalog` (e.g. `tbl.catalog`) in this
     process, if given, instead of building the catalog from `catalog` again.
@@ -449,38 +468,32 @@ def catalog_credentials(
     from polars.io.cloud.credential_provider._providers import (
         CredentialProviderIceberg,
     )
-    from polars.io.iceberg._dataset import (
-        _convert_iceberg_to_object_store_storage_options,
-    )
     from polars.io.iceberg._plugin import _is_credential_key
 
-    user_options = _convert_iceberg_to_object_store_storage_options(
-        dict(user_storage_options or {})
-    )
-
     try:
-        options = catalog_storage_options(catalog_properties, location)
+        options = _storage_options(catalog_properties, location, user_storage_options)
     except NotImplementedError as error:
         if on_unsupported != "user_options":
             raise
         if verbose():
             eprint(f"catalog_credentials: {table_identifier}: user options ({error})")
-        return user_options, None
+        if user_storage_options is None:
+            return None, None
+        return _user_storage_options(user_storage_options), None
 
-    if any(_is_credential_key(k) for k in user_options):
+    if user_storage_options is not None and any(
+        _is_credential_key(k) for k in _user_storage_options(user_storage_options)
+    ):
         # Mixing the user's credentials with the catalog's (e.g. a profile with
         # vended keys) is ambiguous, and rejected by the credential provider.
-        options = {
-            k: v for k, v in options.items() if k not in _CATALOG_CREDENTIAL_KEYS
-        }
-        options.update(user_options)
         if verbose():
             eprint(f"catalog_credentials: {table_identifier}: user credentials")
         return options, None
 
-    options.update(user_options)
-    static, credentials = split_vended_options(options, configured_properties, location)
-    if not credentials:
+    vended = _vended_credential_keys(
+        catalog_properties, configured_properties, location
+    )
+    if not vended:
         if verbose():
             eprint(f"catalog_credentials: {table_identifier}: nothing vended")
         return options, None
@@ -496,10 +509,28 @@ def catalog_credentials(
 
     if verbose():
         eprint(f"catalog_credentials: {table_identifier}: vended credential provider")
+    static = {k: v for k, v in options.items() if k not in vended}
     provider = CredentialProviderIceberg(catalog, table_identifier, location)
     if live_catalog is not None and not isinstance(live_catalog, NoopCatalog):
         provider._catalog_.set(live_catalog)
     return static, provider
+
+
+def _vended_credential_keys(
+    properties: Mapping[str, Any],
+    configured_properties: Mapping[str, Any] | None,
+    location: str,
+) -> frozenset[str]:
+    """
+    Object store keys of the credentials a catalog vended in FileIO `properties`.
+
+    Those of `location`'s cloud, or of every cloud for a location outside the
+    clouds, whose values differ from the catalog's own configuration
+    (`configured_properties`).
+    """
+    options = catalog_storage_options(properties, location, all_backends=True)
+    static, _ = split_vended_options(options, configured_properties, location)
+    return frozenset(options.keys() - static.keys())
 
 
 def fetch_vended_properties(
@@ -544,7 +575,7 @@ def fetch_vended_properties(
 def _has_credentials(properties: Mapping[str, Any], location: str) -> bool:
     """Whether FileIO `properties` hold credentials for `location`."""
     try:
-        options = catalog_storage_options(properties, location)
+        options = catalog_storage_options(properties, location, all_backends=True)
     except NotImplementedError:
         # Not for the fallback to decide; the caller raises.
         return True

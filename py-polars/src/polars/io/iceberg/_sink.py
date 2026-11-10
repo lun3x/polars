@@ -15,7 +15,7 @@ from polars._utils.wrap import wrap_ldf
 from polars.exceptions import ComputeError
 from polars.io.cloud._utils import NoPickleOption
 from polars.io.iceberg._catalog_resolver import check_catalog_name, resolve_catalog
-from polars.io.iceberg._credentials import catalog_credentials
+from polars.io.iceberg._credentials import catalog_credentials, native_location
 from polars.io.iceberg._dataset import (
     IcebergCatalogConfig,
 )
@@ -1554,36 +1554,36 @@ class IcebergSinkState:
                 estimated_compression_ratio * v, (1 << 64) - 1
             )
 
-        # Vended credentials are refreshed by a provider when the catalog vends
-        # them; otherwise the user's options apply as before.
-        credential_options: dict[str, Any] = {
-            "storage_options": self._get_converted_storage_options()
-        }
-        # A staged table is unknown to its catalog until the commit, so the catalog
-        # cannot refresh its credentials. `metadata_location` is optional in REST
-        # catalog responses, despite the annotation.
-        if not isinstance(table, StagedTable) and table.metadata_location is not None:
+        # The table's FileIO properties, as for scans. Vended credentials are
+        # refreshed by a provider (and left out of the options) when the catalog
+        # vends them.
+        credential_options: dict[str, Any]
+        if isinstance(table, StagedTable):
+            # A staged table is unknown to its catalog until the commit, so the
+            # catalog cannot refresh its credentials.
+            credential_options = {
+                "storage_options": self._get_converted_storage_options()
+            }
+        else:
             static_options, provider = catalog_credentials(
                 catalog=self.catalog_source(),
                 table_identifier=tuple(table.name()),
-                location=table.metadata_location,
+                location=native_location(table),
                 catalog_properties=table.io.properties,
                 user_storage_options=self.iceberg_storage_properties,
                 on_unsupported="user_options",
                 configured_properties=table.catalog.properties,
                 live_catalog=table.catalog,
             )
+            credential_options = {"storage_options": static_options or {}}
             if provider is not None:
                 from polars.io.cloud.credential_provider._builder import (
                     CredentialProviderBuilder,
                 )
 
-                credential_options = {
-                    "storage_options": static_options,
-                    "credential_provider": (
-                        CredentialProviderBuilder.from_initialized_provider(provider)
-                    ),
-                }
+                credential_options["credential_provider"] = (
+                    CredentialProviderBuilder.from_initialized_provider(provider)
+                )
 
         return lf.sink_parquet(
             pl.PartitionBy(

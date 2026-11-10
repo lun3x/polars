@@ -40,13 +40,13 @@ from polars.io.iceberg._credentials import (
     _AZURE_SCHEMES as _AZURE_SCHEMES,
 )
 from polars.io.iceberg._credentials import (
+    _PROPERTY_SCHEMES as _PROPERTY_SCHEMES,
+)
+from polars.io.iceberg._credentials import (
     _S3_CLIENT_PROPERTIES as _S3_CLIENT_PROPERTIES,
 )
 from polars.io.iceberg._credentials import (
     _UNSUPPORTED_IO_PROPERTIES as _UNSUPPORTED_IO_PROPERTIES,
-)
-from polars.io.iceberg._credentials import (
-    _PROPERTY_SCHEMES as _PROPERTY_SCHEMES,
 )
 from polars.io.iceberg._credentials import (
     _backend as _backend,
@@ -71,11 +71,12 @@ from polars.io.iceberg._credentials import (
 )
 from polars.io.iceberg._credentials import (
     catalog_credentials,
-)
-from polars.io.iceberg._credentials import (
-    catalog_storage_options as _catalog_storage_options,
+    catalog_storage_options,
 )
 from polars.io.scan_options.cast_options import ScanCastOptions
+
+# Under its old name, for existing importers.
+_catalog_storage_options = catalog_storage_options
 
 if TYPE_CHECKING:
     import pyiceberg.expressions
