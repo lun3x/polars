@@ -3150,6 +3150,13 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             set up, so catalog names in the LazyFrame's own scans are resolved
             then, in the calling process.
 
+            When the catalog vends storage credentials, the plan carries a
+            credential provider that asks the catalog again when they expire,
+            through the resolver for a catalog name, or by rebuilding the catalog
+            from its pickled configuration otherwise. A sink to a `pyiceberg`
+            `Table` target carries its catalog's configuration, including its
+            properties, in the plan, as a scan of a `Table` object does.
+
             .. warning::
                 Passing a catalog name is considered **unstable**. It may be
                 changed at any point without it being considered a breaking change.

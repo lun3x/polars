@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import importlib.metadata
 import os
+import pickle
 from typing import TYPE_CHECKING, Any
 
-from polars._utils.logging import eprint, verbose
+from polars._utils.logging import verbose
 from polars._utils.wrap import wrap_ldf
 from polars._warnings import issue_warning
 from polars.exceptions import ComputeError, PerformanceWarning
 from polars.io.cloud.credential_provider._builder import (
+    CredentialProviderBuilder,
     _init_credential_provider_builder,
 )
 from polars.io.iceberg._cache import (
@@ -32,16 +34,57 @@ from polars.io.iceberg._cache import (
     get_metadata_file_cache,
     plugin_storage_scope,
 )
+
+# Moved to `_credentials`; re-exported under their old names for existing importers.
+from polars.io.iceberg._credentials import (
+    _AZURE_SCHEMES as _AZURE_SCHEMES,
+)
+from polars.io.iceberg._credentials import (
+    _PROPERTY_SCHEMES as _PROPERTY_SCHEMES,
+)
+from polars.io.iceberg._credentials import (
+    _S3_CLIENT_PROPERTIES as _S3_CLIENT_PROPERTIES,
+)
+from polars.io.iceberg._credentials import (
+    _UNSUPPORTED_IO_PROPERTIES as _UNSUPPORTED_IO_PROPERTIES,
+)
+from polars.io.iceberg._credentials import (
+    _backend as _backend,
+)
+from polars.io.iceberg._credentials import (
+    _configures as _configures,
+)
+from polars.io.iceberg._credentials import (
+    _native_storage_options as _native_storage_options,
+)
+from polars.io.iceberg._credentials import (
+    _property_is_true as _property_is_true,
+)
+from polars.io.iceberg._credentials import (
+    _storage_options as _storage_options,
+)
+from polars.io.iceberg._credentials import (
+    _url_scheme as _url_scheme,
+)
+from polars.io.iceberg._credentials import (
+    _user_storage_options as _user_storage_options,
+)
+from polars.io.iceberg._credentials import (
+    catalog_credentials,
+    catalog_storage_options,
+)
 from polars.io.scan_options.cast_options import ScanCastOptions
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping
+# Under its old name, for existing importers.
+_catalog_storage_options = catalog_storage_options
 
+if TYPE_CHECKING:
     import pyiceberg.expressions
     import pyiceberg.table
 
     from polars import LazyFrame
     from polars._typing import StorageOptionsDict
+    from polars.io.iceberg._credentials import CatalogSource
 
 # Python distribution name of the plugin, as used with pip.
 PLUGIN_PACKAGE_NAME = "polars_iceberg"
@@ -129,8 +172,15 @@ def plugin_scan(
     use_metadata_statistics: bool,
     fast_deletion_count: bool,
     user_storage_options: StorageOptionsDict | None,
+    catalog: CatalogSource | None,
+    table_identifier: tuple[str, ...] | None,
 ) -> LazyFrame:
-    """Plan the scan of `tbl` with the plugin; returns the native parquet scan."""
+    """
+    Plan the scan of `tbl` with the plugin; returns the native parquet scan.
+
+    `catalog` and `table_identifier` locate the table in its catalog, to refresh
+    vended credentials; `None` when unknown.
+    """
     from polars.io.iceberg._utils import name_mapping_by_field_id
 
     plr = _plr()
@@ -149,22 +199,45 @@ def plugin_scan(
         msg = "iceberg: unsupported: table without a metadata location"
         raise NotImplementedError(msg)
 
-    storage_options = _storage_options(
-        tbl.io.properties, metadata_location, user_storage_options
-    )
-
-    credential_provider = _init_credential_provider_builder(
-        "auto", metadata_location, storage_options, "scan_iceberg"
+    # Catalog-provided IO properties (e.g. vended credentials) with known object store
+    # equivalents, overridden by the user's storage options. Vended credentials are
+    # refreshed by a provider when the table's catalog is known.
+    storage_options, provider = catalog_credentials(
+        catalog=catalog,
+        table_identifier=table_identifier,
+        location=metadata_location,
+        catalog_properties=tbl.io.properties,
+        user_storage_options=user_storage_options,
+        on_unsupported="raise",
+        configured_properties=tbl.catalog.properties,
+        live_catalog=tbl.catalog,
     )
 
     # Immutable metadata files are cached across scans with the same storage
     # configuration, as with the PyIceberg planner.
     metadata_cache = get_metadata_file_cache()
-    metadata_cache_scope = (
-        plugin_storage_scope(tbl.io, user_storage_options)
-        if metadata_cache.enabled
-        else None
-    )
+    metadata_cache_scope = None
+    credential_provider: CredentialProviderBuilder | None
+    if provider is not None:
+        credential_provider = CredentialProviderBuilder.from_initialized_provider(
+            provider
+        )
+        if metadata_cache.enabled:
+            try:
+                provider_scope = pickle.dumps(provider)
+            except Exception:
+                # Providers that cannot be fingerprinted bypass the cache.
+                provider_scope = None
+            if provider_scope is not None:
+                metadata_cache_scope = plugin_storage_scope(
+                    tbl.io, user_storage_options, provider_scope=provider_scope
+                )
+    else:
+        credential_provider = _init_credential_provider_builder(
+            "auto", metadata_location, storage_options, "scan_iceberg"
+        )
+        if metadata_cache.enabled:
+            metadata_cache_scope = plugin_storage_scope(tbl.io, user_storage_options)
 
     return wrap_ldf(
         plr._iceberg_plugin_scan(
@@ -200,210 +273,6 @@ def plugin_scan(
             name_mapping=name_mapping_by_field_id(tbl),
         )
     )
-
-
-_AZURE_SCHEMES = ("abfs", "abfss", "adl", "az", "azure", "wasb", "wasbs")
-
-# FileIO properties that PyIceberg honours and that have no object store equivalent,
-# by URL scheme.
-_UNSUPPORTED_IO_PROPERTIES: dict[tuple[str, ...], tuple[str, ...]] = {
-    ("s3", "s3a", "s3n"): (
-        # Remote signing (PyIceberg only signs with `s3.signer` set).
-        "s3.signer",
-        "s3.role-arn",
-        "s3.role-session-name",
-        "s3.profile-name",
-        "client.role-arn",
-        "client.role-session-name",
-        "client.profile-name",
-    ),
-    _AZURE_SCHEMES: (
-        "adls.connection-string",
-        "adls.credential",
-        "adls.blob-storage-authority",
-        "adls.dfs-storage-authority",
-        "adls.blob-storage-scheme",
-        "adls.dfs-storage-scheme",
-    ),
-    ("gs", "gcs"): ("gcs.service.host", "gcs.requester-pays"),
-    ("hf",): ("hf.endpoint",),
-}
-
-# PyIceberg's fallbacks for S3 properties.
-_S3_CLIENT_PROPERTIES = {
-    "client.access-key-id": "s3.access-key-id",
-    "client.secret-access-key": "s3.secret-access-key",
-    "client.session-token": "s3.session-token",
-    "client.region": "s3.region",
-}
-
-# FileIO property prefixes, by the URL schemes they configure.
-_PROPERTY_SCHEMES: dict[str, tuple[str, ...]] = {
-    "s3.": ("s3", "s3a", "s3n"),
-    "client.": ("s3", "s3a", "s3n"),
-    "adls.": _AZURE_SCHEMES,
-    "gcs.": ("gs", "gcs"),
-    "hf.": ("hf",),
-}
-
-
-def _storage_options(
-    properties: Mapping[str, Any],
-    location: str,
-    user_storage_options: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    """
-    Object store options of a table at `location`.
-
-    Its FileIO properties (e.g. vended credentials) with known object store
-    equivalents, overridden by the user's storage options. Raises
-    `NotImplementedError` as `_catalog_storage_options`.
-    """
-    storage_options = _catalog_storage_options(properties, location)
-    if user_storage_options is not None:
-        user_options = _user_storage_options(user_storage_options)
-        # The user's credentials replace the catalog's as a whole: mixing them
-        # (e.g. a profile with vended keys) is ambiguous, and rejected by the
-        # credential provider.
-        if any(_is_credential_key(k) for k in user_options):
-            storage_options = {
-                k: v
-                for k, v in storage_options.items()
-                if k not in _CATALOG_CREDENTIAL_KEYS
-            }
-        # User keys last, in their order: of two aliases, the later one wins.
-        storage_options = {
-            k: v for k, v in storage_options.items() if k not in user_options
-        }
-        storage_options.update(user_options)
-    return storage_options
-
-
-def _user_storage_options(user_storage_options: Mapping[str, Any]) -> dict[str, Any]:
-    """The user's storage options as object store options."""
-    from polars.io.iceberg._dataset import (
-        _convert_iceberg_to_object_store_storage_options,
-    )
-
-    # Empty values are unset, as for the catalog's.
-    return {
-        k: v
-        for k, v in _convert_iceberg_to_object_store_storage_options(
-            dict(user_storage_options)
-        ).items()
-        if v not in ("", None)
-    }
-
-
-def _native_storage_options(
-    table: pyiceberg.table.Table,
-    user_storage_options: Mapping[str, Any] | None,
-    source: str | None = None,
-) -> dict[str, Any] | None:
-    """
-    Object store options for Polars' own reads and writes of `table`'s files.
-
-    As `_storage_options`, for files at the table's data path, or at `source`
-    (a file to read) if that is on another backend. With FileIO properties that
-    have no object store equivalent, the user's storage options alone.
-    """
-    # Where the table writes its data files: stable across scans, unlike a file.
-    location = table.properties.get("write.data.path") or table.location()
-    # Files on another backend (e.g. added from elsewhere) take its properties.
-    if source is not None and _backend(source) != _backend(location):
-        location = source
-    try:
-        return _storage_options(table.io.properties, location, user_storage_options)
-    except NotImplementedError as e:
-        if verbose():
-            eprint(f"{e}; using the user's storage options only")
-        if user_storage_options is None:
-            return None
-        return _user_storage_options(user_storage_options)
-
-
-def _catalog_storage_options(
-    properties: Mapping[str, Any], location: str
-) -> dict[str, Any]:
-    """
-    Object store options from a table's FileIO properties.
-
-    Raises `NotImplementedError` for properties that change how storage is accessed
-    but have no equivalent, so that PyIceberg plans the scan.
-    """
-    from polars.io.iceberg._dataset import (
-        ICEBERG_TO_OBJECT_STORE_CONFIG_KEY_MAP,
-        _convert_iceberg_property_value,
-    )
-
-    scheme = _url_scheme(location)
-    # Empty values are unset, as in PyIceberg.
-    properties = {
-        k: v
-        for k, v in properties.items()
-        if v not in ("", None) and _configures(k, scheme)
-    }
-    for schemes, keys in _UNSUPPORTED_IO_PROPERTIES.items():
-        if scheme in schemes and (
-            unsupported := sorted(k for k in keys if k in properties)
-        ):
-            msg = f"iceberg: unsupported: FileIO properties: {unsupported}"
-            raise NotImplementedError(msg)
-    if scheme in ("s3", "s3a", "s3n"):
-        if _property_is_true(properties, "s3.remote-signing-enabled"):
-            msg = "iceberg: unsupported: S3 remote signing"
-            raise NotImplementedError(msg)
-        properties = {
-            **{
-                s3_key: properties[k]
-                for k, s3_key in _S3_CLIENT_PROPERTIES.items()
-                if k in properties
-            },
-            **properties,
-        }
-
-    storage_options = {
-        (key := ICEBERG_TO_OBJECT_STORE_CONFIG_KEY_MAP[k]): (
-            _convert_iceberg_property_value(key, v)
-        )
-        for k, v in properties.items()
-        if k in ICEBERG_TO_OBJECT_STORE_CONFIG_KEY_MAP
-    }
-    # Anonymous access.
-    for schemes, anonymous_key, skip_signature_key in (
-        (("s3", "s3a", "s3n"), "s3.anonymous", "aws_skip_signature"),
-        (_AZURE_SCHEMES, "adls.anon", "azure_skip_signature"),
-    ):
-        if scheme in schemes and _property_is_true(properties, anonymous_key):
-            storage_options[skip_signature_key] = "true"
-    return storage_options
-
-
-def _url_scheme(location: str) -> str:
-    return location.split("://", 1)[0].lower() if "://" in location else ""
-
-
-def _backend(location: str) -> tuple[str, ...] | None:
-    """The URL schemes of `location`'s backend, as in `_PROPERTY_SCHEMES`."""
-    scheme = _url_scheme(location)
-    return next((s for s in _PROPERTY_SCHEMES.values() if scheme in s), None)
-
-
-def _configures(key: str, scheme: str) -> bool:
-    """Whether FileIO property `key` applies to `scheme` (other backends' don't)."""
-    return all(
-        scheme in schemes
-        for prefix, schemes in _PROPERTY_SCHEMES.items()
-        if key.startswith(prefix)
-    )
-
-
-def _property_is_true(properties: Mapping[str, Any], key: str) -> bool:
-    # As PyIceberg's `property_as_bool` (`strtobool`); invalid values are false.
-    value = properties.get(key)
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in ("y", "yes", "t", "true", "on", "1")
 
 
 def _row_filter_json(expr: pyiceberg.expressions.BooleanExpression) -> str:
@@ -489,26 +358,6 @@ def _plugin_capsule(supported_ids: list[str]) -> Any:
 
     return polars_iceberg._capsule(max(shared, key=_id_version))
 
-
-# Object store keys of catalog-provided credentials
-# (`_catalog_storage_options` values).
-_CATALOG_CREDENTIAL_KEYS = frozenset(
-    [
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "aws_session_token",
-        "azure_storage_account_key",
-        "azure_storage_sas_key",
-        "azure_storage_tenant_id",
-        "azure_storage_client_id",
-        "azure_storage_client_secret",
-        "azure_storage_token",
-        "bearer_token",
-        "token",
-        "aws_skip_signature",
-        "azure_skip_signature",
-    ]
-)
 
 # Storage option keys (without the `aws_` / `azure_storage_` / `azure_` / `google_`
 # prefixes) of user-provided credentials, which replace the catalog's. Other keys

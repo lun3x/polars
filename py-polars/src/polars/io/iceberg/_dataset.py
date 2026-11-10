@@ -20,8 +20,9 @@ from polars.io.iceberg._cache import (
     load_static_table,
 )
 from polars.io.iceberg._catalog_resolver import catalog_from
+from polars.io.iceberg._credentials import catalog_credentials
 from polars.io.iceberg._plugin import (
-    _native_storage_options,
+    _is_credential_key,
     plugin_planner_required,
     plugin_scan,
     use_plugin_planner,
@@ -52,19 +53,76 @@ if TYPE_CHECKING:
 
     from polars._typing import StorageOptionsDict
     from polars.io.cloud._utils import NoPickleOption
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderIceberg,
+    )
+    from polars.io.iceberg._credentials import CatalogSource
     from polars.lazyframe.frame import LazyFrame
 
 
 class IcebergTableSerializer(ABC):
     @staticmethod
     @abstractmethod
-    def serialize_table(table: pyiceberg.table.Table) -> SerializedTableState: ...
+    def serialize_table(
+        table: pyiceberg.table.Table,
+        descriptor: IcebergCatalogTableDescriptor | None,
+    ) -> SerializedTableState: ...
 
 
 class IcebergScanTableSerializer(IcebergTableSerializer):
     @staticmethod
-    def serialize_table(table: pyiceberg.table.Table) -> SerializedTableState:
-        return table.metadata_location
+    def serialize_table(
+        table: pyiceberg.table.Table,
+        descriptor: IcebergCatalogTableDescriptor | None,
+    ) -> SerializedTableState:
+        """
+        The loaded table's metadata location, and where its catalog is.
+
+        `descriptor` is the one the table was loaded from, if any.
+        """
+        from polars.io.iceberg._credentials import (
+            credential_storage_options,
+            split_vended_options,
+        )
+
+        catalog = (
+            descriptor.catalog_config
+            if descriptor is not None
+            else _catalog_config_of(table.catalog)
+        )
+        location = table.metadata_location
+        try:
+            vended = bool(
+                split_vended_options(
+                    credential_storage_options(table.io.properties, location),
+                    table.catalog.properties,
+                    location,
+                )[1]
+            )
+        except Exception as error:
+            # Unsupported or malformed properties: not refreshed, and the table
+            # still pickles.
+            if verbose():
+                eprint(f"IcebergScanTableSerializer: not vended ({error = })")
+            vended = False
+
+        return IcebergLoadedTableState(
+            metadata_location=location,
+            catalog=catalog,
+            table_identifier=tuple(table.name()),
+            vended=vended,
+        )
+
+
+def _catalog_config_of(
+    catalog: pyiceberg.catalog.Catalog,
+) -> IcebergCatalogConfig | None:
+    """Config of a table's catalog; `None` for the catalog of a static table."""
+    from pyiceberg.catalog.noop import NoopCatalog
+
+    if isinstance(catalog, NoopCatalog):
+        return None
+    return IcebergCatalogConfig.from_catalog(catalog)
 
 
 @dataclass(kw_only=True)
@@ -77,6 +135,19 @@ class IcebergCatalogTableDescriptor:
     catalog_: NoPickleOption[pyiceberg.catalog.Catalog] | None = None
     # The table's name in SQL, for the error when it does not exist.
     display_name: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class IcebergLoadedTableState:
+    """A loaded table, pickled: its snapshot, and the catalog it came from."""
+
+    metadata_location: str
+    # `None` when the catalog is unknown (e.g. a static table).
+    catalog: CatalogSource | None
+    table_identifier: tuple[str, ...]
+    # Whether the catalog vended storage credentials, which are fetched again when
+    # the table is loaded from this state.
+    vended: bool
 
 
 # Catalog classes whose instances, and those of their subclasses, can load tables
@@ -101,7 +172,17 @@ def _reusable_catalog(
     return catalog
 
 
-SerializedTableState: TypeAlias = str | IcebergCatalogTableDescriptor
+SerializedTableState: TypeAlias = (
+    str | IcebergCatalogTableDescriptor | IcebergLoadedTableState
+)
+
+
+def _describe_catalog(catalog: CatalogSource | None) -> str:
+    if isinstance(catalog, str):
+        return f"catalog name {catalog!r}"
+    if catalog is None:
+        return "no catalog"
+    return f"catalog class {catalog.class_}"
 
 
 def _load_static_table(
@@ -149,17 +230,22 @@ class IcebergTableWrap:
         if self.table_.get() is None:
             if verbose():
                 descriptor = self.table_descriptor_
-                from_ = (
-                    "catalog table descriptor: "
-                    f"{descriptor.table_identifier = }, "
-                    + (
-                        f"catalog name {descriptor.catalog_config!r}"
-                        if isinstance(descriptor.catalog_config, str)
-                        else f"{descriptor.catalog_config.class_ = }"
+                if isinstance(descriptor, IcebergCatalogTableDescriptor):
+                    from_ = (
+                        "catalog table descriptor: "
+                        f"{descriptor.table_identifier = }, "
+                        f"{_describe_catalog(descriptor.catalog_config)}"
                     )
-                    if isinstance(descriptor, IcebergCatalogTableDescriptor)
-                    else f"metadata path: {descriptor}"
-                )
+                elif isinstance(descriptor, IcebergLoadedTableState):
+                    from_ = (
+                        "loaded table state: "
+                        f"{descriptor.metadata_location = }, "
+                        f"{descriptor.table_identifier = }, "
+                        f"{_describe_catalog(descriptor.catalog)}, "
+                        f"{descriptor.vended = }"
+                    )
+                else:
+                    from_ = f"metadata path: {descriptor}"
 
                 eprint(f"IcebergTableWrap: construct table from {from_}")
 
@@ -175,6 +261,8 @@ class IcebergTableWrap:
                     eprint("IcebergTableWrap: reuse catalog instance")
 
                 table = _load_catalog_table(catalog, self.table_descriptor_)
+            elif isinstance(self.table_descriptor_, IcebergLoadedTableState):
+                table = self._load_from_state(self.table_descriptor_)
             else:
                 table = _load_static_table(
                     self.table_descriptor_, self.iceberg_storage_properties or {}
@@ -184,6 +272,65 @@ class IcebergTableWrap:
 
         return self.table_.get()  # type: ignore[return-value]
 
+    def _load_from_state(self, state: IcebergLoadedTableState) -> pyiceberg.table.Table:
+        """
+        Load the state's snapshot, with credentials vended afresh if it had any.
+
+        The user's credentials replace the catalog's as a whole: with any, nothing
+        is fetched.
+        """
+        properties: dict[str, Any] = dict(self.iceberg_storage_properties or {})
+        user_has_credentials = any(
+            _is_credential_key(k)
+            for k in _convert_iceberg_to_object_store_storage_options(properties)
+        )
+
+        if state.vended and state.catalog is not None and not user_has_credentials:
+            from polars.io.cloud.credential_provider._providers import (
+                CredentialProviderIceberg,
+            )
+            from polars.io.iceberg._credentials import (
+                provider_credentials_to_iceberg_properties,
+            )
+
+            provider = CredentialProviderIceberg(
+                state.catalog, state.table_identifier, state.metadata_location
+            )
+            credentials, expiry = provider()
+            properties.update(
+                provider_credentials_to_iceberg_properties(
+                    credentials, provider.scheme, expiry
+                )
+            )
+
+        return _load_static_table(state.metadata_location, properties)
+
+    def loaded_state(self) -> IcebergLoadedTableState | None:
+        """The pickled state of a loaded table, if this was unpickled from one."""
+        if isinstance(self.table_descriptor_, IcebergLoadedTableState):
+            return self.table_descriptor_
+        return None
+
+    def catalog_source(
+        self,
+    ) -> tuple[CatalogSource | None, tuple[str, ...] | None]:
+        """The table's catalog and identifier in it, where known."""
+        import pyiceberg.catalog
+
+        descriptor = self.table_descriptor_
+        if isinstance(descriptor, IcebergCatalogTableDescriptor):
+            return descriptor.catalog_config, tuple(
+                pyiceberg.catalog.Catalog.identifier_to_tuple(
+                    descriptor.table_identifier
+                )
+            )
+        if isinstance(descriptor, IcebergLoadedTableState):
+            return descriptor.catalog, descriptor.table_identifier
+        if (table := self.table_.get()) is not None:
+            catalog = _catalog_config_of(table.catalog)
+            return catalog, (tuple(table.name()) if catalog is not None else None)
+        return None, None
+
     def arrow_schema(self) -> pa.schema:
         """Fetch the arrow schema of the table."""
         from pyiceberg.io.pyarrow import schema_to_pyarrow
@@ -191,8 +338,18 @@ class IcebergTableWrap:
         return schema_to_pyarrow(self.get().schema())
 
     def __getstate__(self) -> dict[str, Any]:
-        if (table := self.table_.get()) is not None:
-            self.table_descriptor_ = self.serializer.serialize_table(table)
+        # A table loaded from a loaded state is that state's snapshot; keep the
+        # state, which knows the catalog.
+        if (table := self.table_.get()) is not None and not isinstance(
+            self.table_descriptor_, IcebergLoadedTableState
+        ):
+            descriptor = self.table_descriptor_
+            self.table_descriptor_ = self.serializer.serialize_table(
+                table,
+                descriptor
+                if isinstance(descriptor, IcebergCatalogTableDescriptor)
+                else None,
+            )
 
         assert self.table_descriptor_ is not None
 
@@ -317,6 +474,31 @@ class IcebergScanResolver:
     )
     # The files to read, as planned by the caller: each is read in full.
     file_tasks: list[FileScanTask] | None = field(default=None, repr=False)
+
+    def _catalog_credentials(
+        self, tbl: pyiceberg.table.Table, source: str | None = None
+    ) -> tuple[StorageOptionsDict | None, CredentialProviderIceberg | None]:
+        """
+        Object store options for `tbl`'s files, and a provider of vended credentials.
+
+        The options are the table's FileIO properties and the user's, as
+        `_native_storage_options` gives them for files at the table's data path (or
+        at `source`, on another backend). Vended credentials are refreshed by a
+        provider, and left out of the options, when the table's catalog is known.
+        """
+        from polars.io.iceberg._credentials import native_credential_location
+
+        catalog, table_identifier = self.table.catalog_source()
+        return catalog_credentials(
+            catalog=catalog,
+            table_identifier=table_identifier,
+            location=native_credential_location(tbl, source),
+            catalog_properties=tbl.io.properties,
+            user_storage_options=self.table.iceberg_storage_properties,
+            on_unsupported="user_options",
+            configured_properties=tbl.catalog.properties,
+            live_catalog=tbl.catalog,
+        )
 
     #
     # PythonDatasetProvider interface functions
@@ -541,6 +723,7 @@ class IcebergScanResolver:
                     "plan with the polars_iceberg plugin"
                 )
 
+            catalog, table_identifier = self.table.catalog_source()
             try:
                 lf = plugin_scan(
                     tbl,
@@ -555,6 +738,10 @@ class IcebergScanResolver:
                     use_metadata_statistics=self.use_metadata_statistics,
                     fast_deletion_count=self.fast_deletion_count,
                     user_storage_options=self.table.iceberg_storage_properties,
+                    catalog=catalog,
+                    table_identifier=(
+                        table_identifier if catalog is not None else None
+                    ),
                 )
             except NotImplementedError as e:
                 # A table feature the plugin does not support (e.g. equality deletes),
@@ -882,11 +1069,11 @@ class IcebergScanResolver:
                 else None
             )
 
-            # The table's FileIO properties, as for the plugin's scans
-            storage_options = _native_storage_options(
-                tbl,
-                self.table.iceberg_storage_properties,
-                sources[0] if sources else None,
+            # The table's FileIO properties, as for the plugin's scans; vended
+            # credentials are refreshed by a provider when the table's catalog is
+            # known.
+            storage_options, credential_provider = self._catalog_credentials(
+                tbl, sources[0] if sources else None
             )
 
             return _NativeIcebergScanData(
@@ -914,6 +1101,7 @@ class IcebergScanResolver:
                 min_max_statistics=min_max_statistics,
                 statistics_loader=statistics_loader,
                 storage_options=storage_options,
+                credential_provider=credential_provider,
                 row_count=(
                     (total_physical_rows, total_deleted_rows)
                     if (
@@ -938,11 +1126,23 @@ class IcebergScanResolver:
 
         import polars.io.iceberg._utils
 
+        # The scan is reused while the snapshot is unchanged, but PyIceberg
+        # replaces the metadata of `tbl` on e.g. schema updates.
+        scan_tbl: pyiceberg.table.Table
+        if (credential_provider := self._catalog_credentials(tbl)[1]) is not None:
+            from polars.io.iceberg._file_io import with_refreshing_io
+
+            scan_tbl = with_refreshing_io(
+                tbl,
+                credential_provider,
+                self.table.iceberg_storage_properties or {},
+            )
+        else:
+            scan_tbl = copy.copy(tbl)
+
         func = partial(
             polars.io.iceberg._utils._scan_pyarrow_dataset_impl,
-            # The scan is reused while the snapshot is unchanged, but PyIceberg
-            # replaces the metadata of `tbl` on e.g. schema updates.
-            copy.copy(tbl),
+            scan_tbl,
             snapshot_id=snapshot_id,
             from_snapshot_id_exclusive=self.from_snapshot_id_exclusive,
             to_snapshot_id_inclusive=self.to_snapshot_id_inclusive,
@@ -998,9 +1198,24 @@ class _NativeIcebergScanData(_ResolvedScanDataBase):
     # (physical, deleted)
     row_count: tuple[int, int] | None
     snapshot_id_key: str
+    # Refreshes vended credentials; `None` leaves `scan_parquet`'s default.
+    credential_provider: CredentialProviderIceberg | None = None
 
     def to_lazyframe(self) -> pl.LazyFrame:
+        from polars.io.cloud.credential_provider._builder import (
+            CredentialProviderBuilder,
+        )
         from polars.io.parquet.functions import scan_parquet
+
+        credential_provider_kwargs: dict[str, Any] = (
+            {
+                "credential_provider": CredentialProviderBuilder.from_initialized_provider(
+                    self.credential_provider
+                )
+            }
+            if self.credential_provider is not None
+            else {}
+        )
 
         return scan_parquet(
             self.sources,
@@ -1023,6 +1238,7 @@ class _NativeIcebergScanData(_ResolvedScanDataBase):
             _table_statistics_tight=True,
             _row_count=self.row_count,
             _source_sizes=self.source_sizes,
+            **credential_provider_kwargs,
         )
 
 

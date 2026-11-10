@@ -1,0 +1,1656 @@
+from __future__ import annotations
+
+import pickle
+import time
+from typing import TYPE_CHECKING, Any
+
+import pytest
+
+import polars as pl
+from polars.exceptions import ComputeError
+
+pytest.importorskip("pyiceberg.catalog.sql")
+
+from pyiceberg.catalog.sql import SqlCatalog
+
+from polars.io.cloud._utils import NoPickleOption
+from polars.io.cloud.credential_provider._providers import CredentialProviderIceberg
+from polars.io.iceberg import _credentials as cred
+from polars.io.iceberg._cache import plugin_storage_scope
+from polars.io.iceberg._dataset import (
+    IcebergCatalogConfig,
+    IcebergCatalogTableDescriptor,
+    IcebergLoadedTableState,
+    IcebergScanTableSerializer,
+    IcebergTableWrap,
+    _NativeIcebergScanData,
+)
+from polars.io.iceberg._sink import IcebergSinkState
+from polars.testing import assert_frame_equal
+from tests.unit.io.test_iceberg import new_iceberg_scan_resolver
+
+pytestmark = pytest.mark.write_disk
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+    from pathlib import Path
+
+    from pyiceberg.catalog import Catalog
+    from pyiceberg.table import Table
+
+S3_LOC = "s3://bucket/wh/ns/t/metadata/00001.metadata.json"
+ADLS_LOC = "abfss://c@acct.dfs.core.windows.net/wh/ns/t/metadata/1.metadata.json"
+GCS_LOC = "gs://bucket/wh/ns/t/metadata/1.metadata.json"
+
+
+def test_cloud_scheme() -> None:
+    assert cred.cloud_scheme(S3_LOC) == "aws"
+    assert cred.cloud_scheme(ADLS_LOC) == "azure"
+    assert cred.cloud_scheme(GCS_LOC) == "gcp"
+    assert cred.cloud_scheme("file:///tmp/t/metadata/1.metadata.json") is None
+
+
+def test_adls_account_host() -> None:
+    assert cred.adls_account_host(ADLS_LOC) == "acct.dfs.core.windows.net"
+    assert cred.adls_account_host(S3_LOC) is None
+
+
+def test_catalog_storage_options_adls_suffixed_token_matches_account() -> None:
+    props = {
+        "adls.sas-token.acct.dfs.core.windows.net": "sig=A",
+        "adls.sas-token.other.dfs.core.windows.net": "sig=B",
+    }
+    assert cred.catalog_storage_options(props, ADLS_LOC) == {
+        "azure_storage_sas_key": "sig=A"
+    }
+
+
+def test_catalog_storage_options_adls_no_matching_account() -> None:
+    props = {"adls.sas-token.other.dfs.core.windows.net": "sig=B"}
+    assert cred.catalog_storage_options(props, ADLS_LOC) == {}
+
+
+def test_split_credential_options_renames_azure_keys() -> None:
+    static, creds = cred.split_credential_options(
+        {
+            "azure_storage_sas_key": "sig",
+            "azure_storage_account_name": "acct",
+            "azure_skip_signature": "true",
+        },
+        "azure",
+    )
+    assert creds == {"sas_token": "sig"}
+    assert static == {
+        "azure_storage_account_name": "acct",
+        "azure_skip_signature": "true",
+    }
+
+
+def test_split_credential_options_aws() -> None:
+    static, creds = cred.split_credential_options(
+        {
+            "aws_access_key_id": "k",
+            "aws_secret_access_key": "s",
+            "aws_session_token": "t",
+            "aws_region": "eu-west-1",
+            "aws_endpoint_url": "http://x",
+        },
+        "aws",
+    )
+    assert creds == {
+        "aws_access_key_id": "k",
+        "aws_secret_access_key": "s",
+        "aws_session_token": "t",
+    }
+    assert static == {"aws_region": "eu-west-1", "aws_endpoint_url": "http://x"}
+
+
+def test_split_credential_options_other_family_is_static() -> None:
+    static, creds = cred.split_credential_options(
+        {"aws_access_key_id": "k", "bearer_token": "b"}, "gcp"
+    )
+    assert creds == {"bearer_token": "b"}
+    assert static == {"aws_access_key_id": "k"}
+
+
+def test_split_credential_options_without_scheme() -> None:
+    assert cred.split_credential_options(
+        {"aws_access_key_id": "k", "aws_secret_access_key": "s", "aws_region": "r"},
+        None,
+    ) == ({"aws_region": "r"}, {"aws_access_key_id": "k", "aws_secret_access_key": "s"})
+
+
+@pytest.mark.parametrize(
+    ("props", "loc", "expected"),
+    [
+        (
+            {"s3.session-token-expires-at-ms": str((1_000_000 + 3600) * 1000)},
+            S3_LOC,
+            1_000_000 + 3600 - 300,
+        ),
+        (
+            {"s3.session-token-expires-at-ms": str((1_000_000 + 100) * 1000)},
+            S3_LOC,
+            1_000_000 + 60,
+        ),
+        (
+            {
+                "adls.sas-token-expires-at-ms.acct.dfs.core.windows.net": str(
+                    (1_000_000 + 3600) * 1000
+                )
+            },
+            ADLS_LOC,
+            1_000_000 + 3600 - 300,
+        ),
+        (
+            {"gcs.oauth2.token-expires-at": str((1_000_000 + 3600) * 1000)},
+            GCS_LOC,
+            1_000_000 + 3600 - 300,
+        ),
+        ({}, S3_LOC, 1_000_000 + 900),
+    ],
+)
+def test_vended_expiry(props: dict[str, str], loc: str, expected: int) -> None:
+    assert cred.vended_expiry(props, loc, now=1_000_000) == expected
+
+
+@pytest.fixture(autouse=True)
+def _reset_resolver() -> Iterator[None]:
+    yield
+    pl.Config.set_iceberg_catalog_resolver(None)
+
+
+@pytest.fixture(autouse=True)
+def sqlcatalog_uses_null_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    # the default pool keeps sqlite connections open past the test (ResourceWarning)
+    import pyiceberg.catalog.sql as pyiceberg_sql
+    from sqlalchemy.pool import NullPool
+
+    create_engine = pyiceberg_sql.create_engine  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        pyiceberg_sql,
+        "create_engine",
+        lambda url, **kwargs: create_engine(url, **{**kwargs, "poolclass": NullPool}),
+    )
+
+
+class VendingCatalog(SqlCatalog):
+    """A SqlCatalog whose loaded tables carry vended S3 credentials in io.properties."""
+
+    def __init__(
+        self,
+        *args: Any,
+        expires_in_ms: int | None = 3_600_000,
+        with_load_credentials: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.vends = 0
+        self.expires_in_ms = expires_in_ms
+        if with_load_credentials:
+            self.load_credentials = self._load_credentials
+
+    def _vended(self) -> dict[str, str]:
+        self.vends += 1
+        props = {
+            "s3.access-key-id": f"AK{self.vends}",
+            "s3.secret-access-key": "SK",
+            "s3.session-token": f"TOK{self.vends}",
+            "s3.region": "eu-west-1",
+        }
+        if self.expires_in_ms is not None:
+            props["s3.session-token-expires-at-ms"] = str(
+                int(time.time() * 1000) + self.expires_in_ms
+            )
+        return props
+
+    def load_table(self, identifier: Any) -> Table:
+        tbl = super().load_table(identifier)
+        tbl.io.properties.update(self._vended())
+        return tbl
+
+    def _load_credentials(self, identifier: Any, location: str) -> dict[str, str]:
+        self.credential_calls = getattr(self, "credential_calls", 0) + 1
+        self.credential_location = location
+        return self._vended()
+
+
+class LoadCredentialsCatalog(VendingCatalog):
+    """A `VendingCatalog` with `load_credentials`, also when built from its config."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, with_load_credentials=True, **kwargs)
+
+
+def new_catalog(
+    tmp_path: Path,
+    name: str,
+    df: pl.DataFrame,
+    catalog_class: type[SqlCatalog] = SqlCatalog,
+    **kwargs: Any,
+) -> SqlCatalog:
+    path = tmp_path / name
+    path.mkdir()
+    catalog = catalog_class(
+        name,
+        uri=f"sqlite:///{path / 'catalog.db'}",
+        warehouse=f"file://{path}",
+        **kwargs,
+    )
+    catalog.create_namespace("ns")
+    table = catalog.create_table(("ns", "t"), schema=df.to_arrow().schema)
+    df.write_iceberg(table, mode="append")
+    return catalog
+
+
+def new_vending_catalog(tmp_path: Path, **kwargs: Any) -> VendingCatalog:
+    catalog = new_catalog(
+        tmp_path, "vending", pl.DataFrame({"a": [1, 2]}), VendingCatalog, **kwargs
+    )
+    assert isinstance(catalog, VendingCatalog)
+    # Table setup above loaded the table; count vends from here.
+    catalog.vends = 0
+    return catalog
+
+
+@pytest.fixture
+def vending(tmp_path: Path) -> VendingCatalog:
+    return new_vending_catalog(tmp_path)
+
+
+@pytest.fixture
+def sales(tmp_path: Path) -> SqlCatalog:
+    return new_catalog(tmp_path, "sales", pl.DataFrame({"a": [1, 2]}))
+
+
+def recording(catalog: Catalog) -> tuple[Callable[[str], Catalog], list[str]]:
+    names: list[str] = []
+
+    def resolve(name: str) -> Catalog:
+        names.append(name)
+        return catalog
+
+    return resolve, names
+
+
+def test_provider_is_not_public() -> None:
+    import polars.io.cloud.credential_provider as credential_provider
+
+    assert "CredentialProviderIceberg" not in credential_provider.__all__
+    assert not hasattr(credential_provider, "CredentialProviderIceberg")
+
+
+def test_provider_returns_only_credential_keys_and_expiry(
+    vending: VendingCatalog,
+) -> None:
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t"), S3_LOC
+    )
+    creds, expiry = p()
+    assert creds == {
+        "aws_access_key_id": "AK1",
+        "aws_secret_access_key": "SK",
+        "aws_session_token": "TOK1",
+    }
+    assert expiry is not None
+    assert time.time() + 3000 < expiry < time.time() + 3400
+
+
+def test_provider_default_ttl_without_expiry_key(tmp_path: Path) -> None:
+    cat = new_vending_catalog(tmp_path, expires_in_ms=None)
+    # By name: a config would build a new catalog with the default expiry.
+    pl.Config.set_iceberg_catalog_resolver(recording(cat)[0])
+    _, expiry = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)()
+    assert expiry is not None
+    assert time.time() + 850 < expiry <= time.time() + 900
+
+
+def test_provider_prefers_load_credentials(tmp_path: Path) -> None:
+    cat = new_vending_catalog(tmp_path, with_load_credentials=True)
+    # By name, so that the provider calls this instance.
+    pl.Config.set_iceberg_catalog_resolver(recording(cat)[0])
+    p = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)
+    p()
+    assert cat.credential_calls == 1
+    assert cat.credential_location == S3_LOC
+    assert cat.vends == 1
+
+
+def test_provider_falls_back_to_load_table_when_load_credentials_fails(
+    vending: VendingCatalog,
+) -> None:
+    def fail(identifier: Any, location: str) -> dict[str, str]:
+        msg = "no credentials endpoint"
+        raise RuntimeError(msg)
+
+    vending.load_credentials = fail  # type: ignore[attr-defined]
+    pl.Config.set_iceberg_catalog_resolver(recording(vending)[0])
+    creds, _ = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)()
+    assert creds["aws_access_key_id"] == "AK1"
+
+
+def test_provider_falls_back_to_load_table_when_load_credentials_vends_nothing(
+    tmp_path: Path,
+) -> None:
+    # E.g. no prefix matches the location, or the server vends through `loadTable`.
+    cat = new_vending_catalog(tmp_path, with_load_credentials=True)
+    cat.load_credentials = lambda identifier, location: {}  # type: ignore[attr-defined]
+    pl.Config.set_iceberg_catalog_resolver(recording(cat)[0])
+    creds, _ = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)()
+    assert creds["aws_access_key_id"] == "AK1"
+    assert cat.vends == 1
+
+
+def test_provider_resolves_name_through_resolver(vending: VendingCatalog) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    creds, _ = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)()
+    assert names == ["sales"]
+    assert creds["aws_access_key_id"] == "AK1"
+
+
+def test_provider_reuses_catalog_instance_and_refetches_when_cleared(
+    vending: VendingCatalog,
+) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    p = CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC)
+    p()
+    p.clear_cached_credentials()
+    creds, _ = p()
+    assert names == ["sales"]
+    assert creds["aws_session_token"] == "TOK2"
+
+
+def test_provider_pickles_without_credentials(vending: VendingCatalog) -> None:
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t"), S3_LOC
+    )
+    p()
+    q = pickle.loads(pickle.dumps(p))
+    assert q._cached_credentials.get() is None
+    assert q._catalog_.get() is None
+    assert q.catalog == p.catalog
+    assert q.table_identifier == ("ns", "t")
+    assert pickle.dumps(p) == pickle.dumps(
+        CredentialProviderIceberg(p.catalog, ("ns", "t"), S3_LOC)
+    )
+
+
+def test_provider_raises_when_nothing_vended(sales: SqlCatalog) -> None:
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(sales), ("ns", "t"), S3_LOC
+    )
+    with pytest.raises(ComputeError, match="vended no storage credentials"):
+        p()
+
+
+def test_provider_accepts_local_location(vending: VendingCatalog) -> None:
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending),
+        ("ns", "t"),
+        "file:///x/1.metadata.json",
+    )
+    assert p.scheme is None
+
+
+def test_provider_repr_names_catalog_and_table() -> None:
+    r = repr(CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC))
+    assert "sales" in r
+    assert "ns.t" in r
+
+
+VENDED = {
+    "s3.access-key-id": "AK",
+    "s3.secret-access-key": "SK",
+    "s3.session-token": "T",
+    "s3.region": "eu-west-1",
+}
+GLUE = {"s3.region": "eu-west-1"}
+# Static keys in a catalog's own configuration, as catalog properties.
+CONFIGURED_KEYS: dict[str, Any] = {
+    "s3.access-key-id": "AK",
+    "s3.secret-access-key": "SK",
+}
+
+
+def test_catalog_credentials_engages_provider() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+    )
+    assert static == {"aws_region": "eu-west-1"}
+    assert isinstance(provider, CredentialProviderIceberg)
+    assert provider.catalog == "sales"
+
+
+def test_catalog_credentials_reuses_live_catalog(vending: VendingCatalog) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    _, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+        live_catalog=vending,
+    )
+    assert provider is not None
+    creds, _ = provider()
+    assert names == []
+    assert vending.vends == 1
+    assert creds["aws_access_key_id"] == "AK1"
+    # Not pickled: a deserialized provider resolves the catalog again.
+    restored = pickle.loads(pickle.dumps(provider))
+    restored.clear_cached_credentials()
+    restored()
+    assert names == ["sales"]
+
+
+def test_catalog_credentials_ignores_noop_live_catalog(
+    vending: VendingCatalog,
+) -> None:
+    from pyiceberg.catalog.noop import NoopCatalog
+
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    _, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+        live_catalog=NoopCatalog("static"),
+    )
+    assert provider is not None
+    provider()
+    assert names == ["sales"]
+
+
+def test_catalog_credentials_merges_user_non_credential_options() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options={"aws_endpoint_url": "http://x"},
+    )
+    assert static == {"aws_region": "eu-west-1", "aws_endpoint_url": "http://x"}
+    assert provider is not None
+
+
+def test_catalog_credentials_user_credentials_win() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options={"aws_profile": "me"},
+    )
+    assert provider is None
+    assert static is not None
+    assert "aws_access_key_id" not in static
+    assert static["aws_profile"] == "me"
+
+
+def test_catalog_credentials_nothing_vended() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=GLUE,
+        user_storage_options=None,
+    )
+    assert (static, provider) == ({"aws_region": "eu-west-1"}, None)
+
+
+def test_catalog_credentials_no_source_keeps_static_keys() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog=None,
+        table_identifier=None,
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+    )
+    assert provider is None
+    assert static is not None
+    assert static["aws_access_key_id"] == "AK"
+
+
+def test_catalog_credentials_unsupported_property_policy() -> None:
+    props = {**GLUE, "s3.role-arn": "arn:aws:iam::1:role/r"}
+    with pytest.raises(NotImplementedError):
+        cred.catalog_credentials(
+            catalog="sales",
+            table_identifier=("ns", "t"),
+            location=S3_LOC,
+            catalog_properties=props,
+            user_storage_options=None,
+        )
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=props,
+        user_storage_options={"aws_region": "us-east-1"},
+        on_unsupported="user_options",
+    )
+    assert (static, provider) == ({"aws_region": "us-east-1"}, None)
+
+
+def test_catalog_credentials_configured_keys_are_static() -> None:
+    # The catalog's own configuration carries the keys: nothing was vended.
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties={**VENDED, "uri": "sqlite://"},
+        user_storage_options=None,
+        configured_properties={**VENDED, "uri": "sqlite://"},
+    )
+    assert provider is None
+    assert static == {
+        "aws_access_key_id": "AK",
+        "aws_secret_access_key": "SK",
+        "aws_session_token": "T",
+        "aws_region": "eu-west-1",
+    }
+
+
+def test_catalog_credentials_keys_differing_from_configured_are_vended() -> None:
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=S3_LOC,
+        catalog_properties=VENDED,
+        user_storage_options=None,
+        configured_properties={**GLUE, "s3.access-key-id": "CONFIGURED"},
+    )
+    assert isinstance(provider, CredentialProviderIceberg)
+    assert static == {"aws_region": "eu-west-1"}
+
+
+def test_catalog_credentials_without_configured_properties() -> None:
+    kwargs: dict[str, Any] = {
+        "catalog": "sales",
+        "table_identifier": ("ns", "t"),
+        "location": S3_LOC,
+        "catalog_properties": VENDED,
+        "user_storage_options": None,
+    }
+    static, provider = cred.catalog_credentials(**kwargs, configured_properties=None)
+    assert static == {"aws_region": "eu-west-1"}
+    assert isinstance(provider, CredentialProviderIceberg)
+    # An unsupported configuration is treated as configuring nothing.
+    static, provider = cred.catalog_credentials(
+        **kwargs, configured_properties={**VENDED, "s3.role-arn": "arn"}
+    )
+    assert static == {"aws_region": "eu-west-1"}
+    assert isinstance(provider, CredentialProviderIceberg)
+
+
+class NativeTable:
+    """What `_native_storage_options` and `native_location` read of a table."""
+
+    def __init__(
+        self,
+        properties: dict[str, Any],
+        location: str,
+        table_properties: dict[str, str] | None = None,
+    ) -> None:
+        self.io = type("IO", (), {"properties": properties})()
+        self._location = location
+        self.properties = table_properties or {}
+
+    def location(self) -> str:
+        return self._location
+
+
+_AWS_CREDENTIALS = {"aws_access_key_id", "aws_secret_access_key", "aws_session_token"}
+
+
+@pytest.mark.parametrize(
+    ("properties", "configured", "location", "user", "vended"),
+    [
+        # Vended, with another backend's properties, which don't apply.
+        (
+            {**VENDED, "adls.account-name": "a", "s3.endpoint": "http://e"},
+            {},
+            "s3://bucket/wh/ns/t",
+            None,
+            True,
+        ),
+        # Vended, with the user's non-credential options last, in their order.
+        (
+            VENDED,
+            {},
+            "s3://bucket/wh/ns/t",
+            {"aws_endpoint": "first", "aws_endpoint_url": "last", "s3.region": ""},
+            True,
+        ),
+        # Configured on the catalog (e.g. static keys): not vended.
+        (VENDED, VENDED, "s3://bucket/wh/ns/t", None, False),
+        # Glue-like: nothing vended.
+        (GLUE, {}, "s3://bucket/wh/ns/t", {"aws_endpoint": "e"}, False),
+        # The user's credentials replace the catalog's.
+        (VENDED, {}, "s3://bucket/wh/ns/t", {"aws_profile": "p"}, False),
+        # No object store equivalent: the user's options alone, or none.
+        ({**VENDED, "s3.role-arn": "arn"}, {}, "s3://bucket/wh/ns/t", None, False),
+        (
+            {**VENDED, "s3.role-arn": "arn"},
+            {},
+            "s3://bucket/wh/ns/t",
+            {"s3.region": "us-east-1"},
+            False,
+        ),
+        # A local table: S3 properties don't apply, but are vended.
+        (VENDED, {}, "file:///tmp/wh/ns/t", None, True),
+    ],
+)
+def test_catalog_credentials_static_half_is_native_storage_options(
+    properties: dict[str, Any],
+    configured: dict[str, Any],
+    location: str,
+    user: dict[str, Any] | None,
+    vended: bool,
+) -> None:
+    from polars.io.iceberg._plugin import _native_storage_options
+
+    table = NativeTable(properties, location)
+    native = _native_storage_options(table, user)  # type: ignore[arg-type]
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=cred.native_location(table),  # type: ignore[arg-type]
+        catalog_properties=properties,
+        user_storage_options=user,
+        on_unsupported="user_options",
+        configured_properties=configured,
+    )
+    assert isinstance(provider, CredentialProviderIceberg) is vended
+    if native is None:
+        assert static is None
+    else:
+        assert static == {
+            k: v for k, v in native.items() if not (vended and k in _AWS_CREDENTIALS)
+        }
+        # In the same order, as of two aliases the later one wins.
+        assert static is not None
+        assert list(static) == [k for k in native if k in static]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("hf://datasets/x/f.parquet", {"token": "x"}),
+        ("https://example.com/f.parquet", {}),
+    ],
+)
+def test_catalog_credentials_non_cloud_source_of_vending_table(
+    source: str, expected: dict[str, Any]
+) -> None:
+    from polars.io.iceberg._plugin import _native_storage_options
+
+    # A file on a non-cloud remote backend, of a table whose catalog vends S3
+    # credentials: those are not for that file, so upstream's options, no provider.
+    properties = {**VENDED, "hf.token": "x"}
+    table = NativeTable(properties, "s3://bucket/wh/ns/t")
+    location = cred.native_credential_location(table, source)  # type: ignore[arg-type]
+    assert location == source
+    static, provider = cred.catalog_credentials(
+        catalog="sales",
+        table_identifier=("ns", "t"),
+        location=location,
+        catalog_properties=properties,
+        user_storage_options=None,
+        on_unsupported="user_options",
+        configured_properties={},
+    )
+    assert provider is None
+    assert static == _native_storage_options(table, None, source) == expected  # type: ignore[arg-type]
+    assert not cred._has_credentials(properties, source)
+
+
+def test_native_credential_location_ends_in_slash() -> None:
+    table = NativeTable({}, "s3://bucket/wh/ns/t")
+    assert cred.native_credential_location(table) == "s3://bucket/wh/ns/t/"  # type: ignore[arg-type]
+    table = NativeTable({}, "s3://bucket/wh/ns/t/", {"write.data.path": "s3://b/d/"})
+    assert cred.native_credential_location(table) == "s3://b/d/"  # type: ignore[arg-type]
+    # A source file on the same backend: the data path.
+    assert cred.native_credential_location(table, "s3://b/d/f.parquet") == "s3://b/d/"  # type: ignore[arg-type]
+    # On another backend: the file itself.
+    assert (
+        cred.native_credential_location(table, "gs://b/f.parquet")  # type: ignore[arg-type]
+        == "gs://b/f.parquet"
+    )
+
+
+def wrap_for_name(name: str, identifier: str = "ns.t") -> IcebergTableWrap:
+    return IcebergTableWrap(
+        table_=NoPickleOption(None),
+        table_descriptor_=IcebergCatalogTableDescriptor(
+            table_identifier=identifier, catalog_config=name
+        ),
+        serializer=IcebergScanTableSerializer(),
+        iceberg_storage_properties=None,
+    )
+
+
+def wrap_for_table(tbl: Table) -> IcebergTableWrap:
+    return IcebergTableWrap(
+        table_=NoPickleOption(tbl),
+        table_descriptor_=None,
+        serializer=IcebergScanTableSerializer(),
+        iceberg_storage_properties=None,
+    )
+
+
+def roundtrip(wrap: IcebergTableWrap) -> IcebergTableWrap:
+    return pickle.loads(pickle.dumps(wrap))  # type: ignore[no-any-return]
+
+
+def test_loaded_state_from_descriptor_scan(vending: VendingCatalog) -> None:
+    resolver, _ = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    wrap = wrap_for_name("sales")
+    wrap.get()  # loads the table
+    state = roundtrip(wrap).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.catalog == "sales"
+    assert state.table_identifier == ("ns", "t")
+    assert state.vended is True
+    assert state.metadata_location.endswith(".metadata.json")
+
+
+def test_loaded_state_from_table_object_carries_catalog_config(
+    vending: VendingCatalog,
+) -> None:
+    tbl = vending.load_table(("ns", "t"))
+    state = roundtrip(wrap_for_table(tbl)).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.catalog == IcebergCatalogConfig.from_catalog(vending)
+    assert state.vended is True
+
+
+def test_loaded_state_unreadable_properties_are_not_vended(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tbl = vending.load_table(("ns", "t"))
+
+    def malformed(properties: Any, location: str) -> dict[str, Any]:
+        msg = "malformed property value"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(cred, "catalog_storage_options", malformed)
+    # Pickling does not fail where it did before vended credentials were refreshed.
+    state = roundtrip(wrap_for_table(tbl)).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.vended is False
+
+
+def test_loaded_state_static_table_has_no_source(sales: SqlCatalog) -> None:
+    from pyiceberg.table import StaticTable
+
+    tbl = StaticTable.from_metadata(sales.load_table(("ns", "t")).metadata_location)
+    state = roundtrip(wrap_for_table(tbl)).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.catalog is None
+    assert state.vended is False
+
+
+def test_loaded_state_glue_like_is_not_vended(sales: SqlCatalog) -> None:
+    state = roundtrip(wrap_for_table(sales.load_table(("ns", "t")))).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.vended is False
+    assert state.catalog == IcebergCatalogConfig.from_catalog(sales)
+
+
+def test_loaded_state_configured_keys_are_not_vended(
+    tmp_path: Path, vending: VendingCatalog
+) -> None:
+    sales = new_catalog(
+        tmp_path, "configured", pl.DataFrame({"a": [1]}), **CONFIGURED_KEYS
+    )
+    tbl = sales.load_table(("ns", "t"))
+    assert tbl.io.properties["s3.access-key-id"] == "AK"
+    state = roundtrip(wrap_for_table(tbl)).table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    assert state.vended is False
+
+    vended_state = roundtrip(
+        wrap_for_table(vending.load_table(("ns", "t")))
+    ).table_descriptor_
+    assert isinstance(vended_state, IcebergLoadedTableState)
+    assert vended_state.vended is True
+
+
+def test_plugin_scan_configured_keys_engage_no_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    from polars.io.iceberg import _plugin
+
+    sales = new_catalog(
+        tmp_path, "configured", pl.DataFrame({"a": [1]}), **CONFIGURED_KEYS
+    )
+    seen: dict[str, Any] = {}
+    real = cred.catalog_credentials
+
+    def recording_catalog_credentials(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        seen["result"] = real(**kwargs)
+        return seen["result"]
+
+    monkeypatch.setattr(_plugin, "catalog_credentials", recording_catalog_credentials)
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "plugin")
+    tbl = sales.load_table(("ns", "t"))
+    pl.scan_iceberg(tbl).collect()
+    assert seen["configured_properties"] is tbl.catalog.properties
+    static, provider = seen["result"]
+    assert provider is None
+    # As without vending: S3 properties don't apply to a local table.
+    assert static == {}
+
+
+def test_get_on_vended_state_fetches_then_loads_from_metadata_location(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    loaded = wrap_for_name("sales")
+    loaded.get()
+    wrap = roundtrip(loaded)
+    loads: list[Any] = []
+
+    def load_table(ident: Any) -> Table:
+        loads.append(ident)
+        return VendingCatalog.load_table(vending, ident)
+
+    monkeypatch.setattr(vending, "load_table", load_table)
+    names.clear()
+    tbl = wrap.get()
+    state = wrap.table_descriptor_
+    assert isinstance(state, IcebergLoadedTableState)
+    # The resolver is called for credentials, and the table loaded only for them
+    # (this catalog has no `load_credentials`).
+    assert names == ["sales"]
+    assert loads == [("ns", "t")]
+    # The pinned snapshot.
+    assert tbl.metadata_location == state.metadata_location
+    assert tbl.io.properties["s3.access-key-id"].startswith("AK")
+
+
+def test_get_on_vended_state_surfaces_refusing_resolver(
+    vending: VendingCatalog,
+) -> None:
+    resolver, _ = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    loaded = wrap_for_name("sales")
+    loaded.get()
+    wrap = roundtrip(loaded)
+
+    def refuse(name: str) -> Catalog:
+        msg = f'catalog "{name}" refused'
+        raise ComputeError(msg)
+
+    pl.Config.set_iceberg_catalog_resolver(refuse)
+    with pytest.raises(ComputeError, match='catalog "sales" refused'):
+        wrap.get()
+
+
+def test_get_on_vended_state_keeps_user_credentials(vending: VendingCatalog) -> None:
+    resolver, names = recording(vending)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    loaded = wrap_for_name("sales")
+    loaded.iceberg_storage_properties = {
+        "s3.access-key-id": "USERKEY",
+        "s3.secret-access-key": "S",
+    }
+    loaded.get()
+    wrap = roundtrip(loaded)
+    names.clear()
+    vending.vends = 0
+    tbl = wrap.get()
+    # The user's credentials replace the catalog's as a whole.
+    assert names == []
+    assert vending.vends == 0
+    assert tbl.io.properties["s3.access-key-id"] == "USERKEY"
+    assert "s3.session-token" not in tbl.io.properties
+
+
+def test_get_on_vended_gcs_state_installs_token_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from polars.io.cloud.credential_provider import _providers
+    from polars.io.iceberg import _dataset
+
+    monkeypatch.setattr(
+        _providers.CredentialProviderIceberg,
+        "retrieve_credentials_impl",
+        lambda self: ({"bearer_token": "tok"}, 1_900_000_000),
+    )
+    loads: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        _dataset,
+        "_load_static_table",
+        lambda location, properties: loads.append(properties),
+    )
+    wrap = IcebergTableWrap(
+        table_=NoPickleOption(None),
+        table_descriptor_=IcebergLoadedTableState(
+            metadata_location=GCS_LOC,
+            catalog="sales",
+            table_identifier=("ns", "t"),
+            vended=True,
+        ),
+        serializer=IcebergScanTableSerializer(),
+        iceberg_storage_properties=None,
+    )
+    wrap.get()
+    # PyArrow takes a GCS token only with its expiry.
+    assert loads == [
+        {
+            "gcs.oauth2.token": "tok",
+            "gcs.oauth2.token-expires-at": "1900000000000",
+        }
+    ]
+
+
+def test_old_str_state_still_loads(sales: SqlCatalog) -> None:
+    tbl = sales.load_table(("ns", "t"))
+    wrap = IcebergTableWrap(
+        table_=NoPickleOption(None),
+        table_descriptor_=tbl.metadata_location,
+        serializer=IcebergScanTableSerializer(),
+        iceberg_storage_properties=None,
+    )
+    assert wrap.get().metadata_location == tbl.metadata_location
+
+
+def test_loaded_state_survives_a_second_roundtrip(vending: VendingCatalog) -> None:
+    pl.Config.set_iceberg_catalog_resolver(recording(vending)[0])
+    loaded = wrap_for_name("sales")
+    loaded.get()
+    wrap = roundtrip(loaded)
+    wrap.get()
+    state = roundtrip(wrap).loaded_state()
+    assert state == wrap.loaded_state()
+    assert state is not None
+    assert state.catalog == "sales"
+
+
+def test_catalog_source() -> None:
+    assert wrap_for_name("sales").catalog_source() == ("sales", ("ns", "t"))
+
+
+@pytest.mark.parametrize(
+    ("creds", "scheme", "expected"),
+    [
+        (
+            {"aws_access_key_id": "k", "aws_secret_access_key": "s"},
+            "aws",
+            {"s3.access-key-id": "k", "s3.secret-access-key": "s"},
+        ),
+        ({"aws_session_token": "t"}, None, {"s3.session-token": "t"}),
+        ({"sas_token": "sig"}, "azure", {"adls.sas-token": "sig"}),
+        ({"account_key": "a"}, "azure", {"adls.account-key": "a"}),
+        ({"bearer_token": "b"}, "azure", {"adls.token": "b"}),
+        (
+            {"bearer_token": "b"},
+            "gcp",
+            {"gcs.oauth2.token": "b", "gcs.oauth2.token-expires-at": "1700000000000"},
+        ),
+        (
+            {"bearer_token": "b"},
+            None,
+            {"gcs.oauth2.token": "b", "gcs.oauth2.token-expires-at": "1700000000000"},
+        ),
+        (
+            {"bearer_token": "b", "sas_token": "sig"},
+            None,
+            {"adls.token": "b", "adls.sas-token": "sig"},
+        ),
+    ],
+)
+def test_provider_credentials_to_iceberg_properties(
+    creds: dict[str, str], scheme: cred.CloudScheme | None, expected: dict[str, str]
+) -> None:
+    assert (
+        cred.provider_credentials_to_iceberg_properties(
+            creds, scheme, expiry=1_700_000_000
+        )
+        == expected
+    )
+
+
+def test_provider_credentials_to_iceberg_properties_gcs_default_expiry() -> None:
+    # PyArrow takes a GCS token only with its expiry.
+    before = int(time.time())
+    props = cred.provider_credentials_to_iceberg_properties(
+        {"bearer_token": "b"}, "gcp"
+    )
+    expires_at_ms = int(props["gcs.oauth2.token-expires-at"])
+    assert (before + 900) * 1000 <= expires_at_ms <= (int(time.time()) + 900) * 1000
+
+
+def test_provider_pickles_identically_after_verbose_cache_hit(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_VERBOSE", "1")
+    p = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t"), S3_LOC
+    )
+    before = pickle.dumps(p)
+    p()
+    # A cache hit under verbose logs once, and remembers that it did.
+    p()
+    assert p._has_logged_use_cache
+    assert pickle.dumps(p) == before
+
+
+def test_plugin_scan_wiring(
+    monkeypatch: pytest.MonkeyPatch, vending: VendingCatalog
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    from polars.io.iceberg import _plugin
+
+    seen: dict[str, Any] = {}
+
+    def fake_catalog_credentials(**kwargs: Any) -> tuple[dict[str, Any], None]:
+        seen.update(kwargs)
+        return {"aws_region": "eu-west-1"}, None
+
+    monkeypatch.setattr(_plugin, "catalog_credentials", fake_catalog_credentials)
+    tbl = vending.load_table(("ns", "t"))
+    _plugin.plugin_scan(
+        tbl,
+        snapshot_id=None,
+        from_snapshot_id_exclusive=None,
+        to_snapshot_id_inclusive=None,
+        projection=None,
+        filter_columns=None,
+        statistics_columns=None,
+        iceberg_table_filter=None,
+        limit=None,
+        use_metadata_statistics=True,
+        fast_deletion_count=False,
+        user_storage_options=None,
+        catalog="sales",
+        table_identifier=("ns", "t"),
+    )
+    assert seen["catalog"] == "sales"
+    assert seen["table_identifier"] == ("ns", "t")
+    assert seen["catalog_properties"] is tbl.io.properties
+    assert seen["on_unsupported"] == "raise"
+
+
+def test_plugin_scan_passes_vended_credential_provider(
+    monkeypatch: pytest.MonkeyPatch, vending: VendingCatalog
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    import polars._plr as plr
+    from polars.io.cloud.credential_provider._builder import (
+        CredentialProviderBuilder,
+    )
+
+    seen: dict[str, Any] = {}
+    real_plugin_scan = plr._iceberg_plugin_scan
+
+    def recording_plugin_scan(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_plugin_scan(*args, **kwargs)
+
+    monkeypatch.setattr(plr, "_iceberg_plugin_scan", recording_plugin_scan)
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "plugin")
+
+    df = pl.scan_iceberg(vending.load_table(("ns", "t"))).collect()
+
+    assert df.to_dict(as_series=False) == {"a": [1, 2]}
+    builder = seen["credential_provider"]
+    assert isinstance(builder, CredentialProviderBuilder)
+    provider = builder.credential_provider_init.credential_provider  # type: ignore[attr-defined]
+    assert isinstance(provider, CredentialProviderIceberg)
+    assert provider.table_identifier == ("ns", "t")
+    # The table's catalog is reused for the first fetch.
+    assert provider._catalog_.get() is vending
+    assert "aws_access_key_id" not in (seen["storage_options"] or {})
+    assert seen["metadata_cache_scope"] is not None
+
+
+def test_plugin_scan_unpicklable_provider_bypasses_metadata_cache(
+    monkeypatch: pytest.MonkeyPatch, vending: VendingCatalog
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    import polars._plr as plr
+
+    seen: dict[str, Any] = {}
+    real_plugin_scan = plr._iceberg_plugin_scan
+
+    def recording_plugin_scan(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_plugin_scan(*args, **kwargs)
+
+    monkeypatch.setattr(plr, "_iceberg_plugin_scan", recording_plugin_scan)
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "plugin")
+
+    tbl = vending.load_table(("ns", "t"))
+    # The provider carries the catalog's config, which cannot be pickled.
+    vending.properties["unpicklable"] = lambda: None  # type: ignore[assignment]
+    df = pl.scan_iceberg(tbl).collect()
+
+    assert df.to_dict(as_series=False) == {"a": [1, 2]}
+    assert seen["credential_provider"] is not None
+    assert seen["metadata_cache_scope"] is None
+
+
+def test_plugin_storage_scope_ignores_credential_values(
+    vending: VendingCatalog,
+) -> None:
+    tbl = vending.load_table(("ns", "t"))
+    a = plugin_storage_scope(tbl.io, None, provider_scope=b"k")
+    assert a is not None
+    tbl.io.properties["s3.session-token"] = "CHANGED"
+    tbl.io.properties["s3.session-token-expires-at-ms"] = "1"
+    assert plugin_storage_scope(tbl.io, None, provider_scope=b"k") == a
+    assert plugin_storage_scope(tbl.io, None, provider_scope=b"other") != a
+    # Without a provider, the credentials stay in the scope.
+    b = plugin_storage_scope(tbl.io, None)
+    tbl.io.properties["s3.session-token"] = "CHANGED AGAIN"
+    assert plugin_storage_scope(tbl.io, None) != b
+
+
+def test_native_scan_data_carries_provider(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    from polars.io.iceberg import _dataset
+
+    monkeypatch.setattr(
+        _dataset,
+        "catalog_credentials",
+        lambda **kw: (
+            {"aws_region": "eu-west-1"},
+            CredentialProviderIceberg("sales", ("ns", "t"), S3_LOC),
+        ),
+    )
+    tbl = vending.load_table(("ns", "t"))
+    scan_data = new_iceberg_scan_resolver(tbl)._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    assert scan_data.storage_options == {"aws_region": "eu-west-1"}
+    assert isinstance(scan_data.credential_provider, CredentialProviderIceberg)
+
+
+def test_native_scan_engages_vended_credential_provider(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    tbl = vending.load_table(("ns", "t"))
+    scan_data = new_iceberg_scan_resolver(tbl)._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    assert isinstance(scan_data.credential_provider, CredentialProviderIceberg)
+    assert scan_data.credential_provider.table_identifier == ("ns", "t")
+    # The table's catalog is reused for the first fetch.
+    assert scan_data.credential_provider._catalog_.get() is vending
+    assert "aws_access_key_id" not in (scan_data.storage_options or {})
+    # Local reads do not use the provider.
+    assert_frame_equal(scan_data.to_lazyframe().collect(), pl.DataFrame({"a": [1, 2]}))
+
+
+def test_native_scan_glue_role_arn_keeps_ambient_credentials(
+    sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    tbl = sales.load_table(("ns", "t"))
+    tbl.io.properties["s3.role-arn"] = "arn:aws:iam::1:role/r"
+    scan_data = new_iceberg_scan_resolver(tbl)._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    # The table's FileIO properties, as without vending: S3 properties don't apply
+    # to a local table.
+    assert scan_data.storage_options == {}
+    assert scan_data.credential_provider is None
+    assert_frame_equal(scan_data.to_lazyframe().collect(), pl.DataFrame({"a": [1, 2]}))
+
+
+def test_native_scan_without_vending_unchanged(
+    sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    scan_data = new_iceberg_scan_resolver(
+        sales.load_table(("ns", "t"))
+    )._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    # The table's FileIO properties, as `_native_storage_options` gives them.
+    assert scan_data.storage_options == {}
+    assert scan_data.credential_provider is None
+
+
+class CountingProvider(CredentialProviderIceberg):
+    """Returns `creds`, counting calls."""
+
+    def __init__(self) -> None:
+        # Bypasses `__init__` validation: a stand-in for tests of the FileIO only.
+        self.calls = 0
+        self.creds = {
+            "aws_access_key_id": "A1",
+            "aws_secret_access_key": "S",
+            "aws_session_token": "T1",
+        }
+        self.scheme = "aws"
+
+    def __call__(self) -> tuple[dict[str, str], int | None]:  # type: ignore[override]
+        self.calls += 1
+        return dict(self.creds), None
+
+
+def test_refreshing_file_io_rebuilds_fs_only_when_credentials_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from polars.io.iceberg._file_io import RefreshingPyArrowFileIO
+
+    p = CountingProvider()
+    io = RefreshingPyArrowFileIO({}, p)
+    builds: list[tuple[str, str | None]] = []
+
+    def initialize_fs(scheme: str, netloc: str | None = None) -> object:
+        builds.append((scheme, netloc))
+        return object()
+
+    monkeypatch.setattr(io, "_initialize_fs", initialize_fs)
+    fs1 = io.fs_by_scheme("file", None)
+    fs2 = io.fs_by_scheme("file", None)
+    assert fs1 is fs2
+    assert builds == [("file", None)]
+    assert p.calls == 2
+    assert io.properties["s3.access-key-id"] == "A1"
+
+    p.creds["aws_session_token"] = "T2"
+    fs3 = io.fs_by_scheme("file", None)
+    assert fs3 is not fs1
+    assert len(builds) == 2
+    assert io.properties["s3.session-token"] == "T2"
+
+
+class GcpCountingProvider(CountingProvider):
+    """Returns a GCS token, and `expiry`."""
+
+    def __init__(self, expiry: int | None) -> None:
+        super().__init__()
+        self.creds = {"bearer_token": "tok"}
+        self.scheme = "gcp"
+        self.expiry = expiry
+
+    def __call__(self) -> tuple[dict[str, str], int | None]:  # type: ignore[override]
+        self.calls += 1
+        return dict(self.creds), self.expiry
+
+
+@pytest.mark.parametrize("expiry", [1_900_000_000, None])
+def test_refreshing_file_io_builds_gcs_fs_with_token_expiry(
+    expiry: int | None,
+) -> None:
+    from pyarrow.fs import GcsFileSystem
+
+    from polars.io.iceberg._file_io import RefreshingPyArrowFileIO
+
+    io = RefreshingPyArrowFileIO({"gcs.project-id": "p"}, GcpCountingProvider(expiry))
+    # PyArrow refuses a token without its expiry.
+    fs = io.fs_by_scheme("gs", "bucket")
+    assert isinstance(fs, GcsFileSystem)
+    assert io.properties["gcs.oauth2.token"] == "tok"
+    expires_at = int(io.properties["gcs.oauth2.token-expires-at"]) // 1000
+    if expiry is not None:
+        assert expires_at == expiry
+    else:
+        assert time.time() + 850 < expires_at <= time.time() + 900
+
+
+def test_refreshing_file_io_pickles_without_credentials() -> None:
+    from polars.io.iceberg._file_io import RefreshingPyArrowFileIO
+
+    io = RefreshingPyArrowFileIO({"s3.region": "eu-west-1"}, CountingProvider())
+    io.fs_by_scheme("file", None)
+    assert io.properties["s3.access-key-id"] == "A1"
+    state = io.__getstate__()
+    assert "_fs_cache" not in state
+    assert "_last_credentials" not in state
+    for key in ("s3.access-key-id", "s3.secret-access-key", "s3.session-token"):
+        assert key not in state["properties"]
+    assert state["properties"]["s3.region"] == "eu-west-1"
+    # Pickling leaves the live FileIO's credentials in place.
+    assert io.properties["s3.session-token"] == "T1"
+
+    restored = pickle.loads(pickle.dumps(io))
+    assert isinstance(restored, RefreshingPyArrowFileIO)
+    assert restored.properties == {"s3.region": "eu-west-1"}
+    # The restored FileIO installs the provider's current credentials.
+    restored._provider.creds["aws_session_token"] = "T2"  # type: ignore[attr-defined]
+    restored.fs_by_scheme("file", None)
+    assert restored._provider.calls == 2  # type: ignore[attr-defined]
+    assert restored.properties["s3.access-key-id"] == "A1"
+    assert restored.properties["s3.session-token"] == "T2"
+
+
+def test_with_refreshing_io_replaces_only_pyarrow_io(vending: VendingCatalog) -> None:
+    from pyiceberg.io.fsspec import FsspecFileIO
+
+    from polars.io.iceberg._file_io import RefreshingPyArrowFileIO, with_refreshing_io
+
+    tbl = vending.load_table(("ns", "t"))
+    assert tbl.io.properties["s3.access-key-id"] == "AK1"
+    out = with_refreshing_io(tbl, CountingProvider(), {"s3.region": "eu-west-1"})
+    assert isinstance(out.io, RefreshingPyArrowFileIO)
+    assert out is not tbl
+    assert out.metadata is tbl.metadata
+    assert "s3.access-key-id" not in out.io.properties
+    assert "s3.session-token-expires-at-ms" not in out.io.properties
+    assert out.io.properties["s3.region"] == "eu-west-1"
+    # The table's own FileIO is untouched.
+    assert tbl.io.properties["s3.access-key-id"] == "AK1"
+
+    tbl.io = FsspecFileIO(dict(tbl.io.properties))
+    out = with_refreshing_io(tbl, CountingProvider(), {})
+    assert out is not tbl
+    assert out.io is tbl.io
+
+
+def test_fallback_reader_uses_refreshing_io(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    import polars.io.iceberg._utils as utils
+    from polars.io.iceberg import _dataset
+
+    provider = CountingProvider()
+    monkeypatch.setattr(_dataset, "catalog_credentials", lambda **kw: ({}, provider))
+    tbl = vending.load_table(("ns", "t"))
+    seen: list[Table] = []
+    real = utils._scan_pyarrow_dataset_impl
+
+    def scan(t: Table, **kw: Any) -> Any:
+        seen.append(t)
+        return real(t, **kw)
+
+    monkeypatch.setattr(utils, "_scan_pyarrow_dataset_impl", scan)
+    assert_frame_equal(
+        pl.scan_iceberg(tbl, reader_override="pyiceberg").collect(),
+        pl.DataFrame({"a": [1, 2]}),
+    )
+    assert seen
+    assert type(seen[0].io).__name__ == "RefreshingPyArrowFileIO"
+    assert provider.calls > 0
+
+
+def test_fallback_reader_without_vending_keeps_table_io(
+    sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    import polars.io.iceberg._utils as utils
+
+    tbl = sales.load_table(("ns", "t"))
+    seen: list[Table] = []
+    real = utils._scan_pyarrow_dataset_impl
+
+    def scan(t: Table, **kw: Any) -> Any:
+        seen.append(t)
+        return real(t, **kw)
+
+    monkeypatch.setattr(utils, "_scan_pyarrow_dataset_impl", scan)
+    assert_frame_equal(
+        pl.scan_iceberg(tbl, reader_override="pyiceberg").collect(),
+        pl.DataFrame({"a": [1, 2]}),
+    )
+    assert seen
+    assert seen[0].io is tbl.io
+
+
+def test_sink_catalog_source_name_and_config(sales: SqlCatalog) -> None:
+    by_name = IcebergSinkState.new("ns.t", catalog="sales")
+    assert by_name.catalog_source() == "sales"
+    by_cfg = IcebergSinkState.new("ns.t", catalog=sales)
+    assert by_cfg.catalog_source() == IcebergCatalogConfig.from_catalog(sales)
+
+
+def test_sink_passes_provider_to_parquet_sink(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from polars.io.iceberg import _sink
+
+    provider = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t"), S3_LOC
+    )
+    monkeypatch.setattr(
+        _sink,
+        "catalog_credentials",
+        lambda **kw: ({"aws_region": "eu-west-1"}, provider),
+    )
+    seen: dict[str, Any] = {}
+    real = pl.LazyFrame.sink_parquet
+
+    def spy(self: pl.LazyFrame, path: Any, **kw: Any) -> Any:
+        seen.update(kw)
+        return real(self, path, **kw)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", spy)
+    pl.DataFrame({"a": [3]}).lazy().sink_iceberg("ns.t", catalog=vending, mode="append")
+    assert seen["storage_options"] == {"aws_region": "eu-west-1"}
+    assert seen["credential_provider"].credential_provider_init.credential_provider is (
+        provider
+    )
+
+
+def test_sink_reuses_table_catalog_for_credentials(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from polars.io.iceberg import _sink
+
+    seen: list[tuple[Any, Any]] = []
+    real = cred.catalog_credentials
+
+    def spy(**kw: Any) -> Any:
+        out = real(**kw)
+        seen.append((kw["live_catalog"], out[1]))
+        return out
+
+    monkeypatch.setattr(_sink, "catalog_credentials", spy)
+    pl.DataFrame({"a": [3]}).lazy().sink_iceberg("ns.t", catalog=vending, mode="append")
+    assert seen
+    # The sink's table's catalog (rebuilt where the plan runs) is reused.
+    for live_catalog, provider in seen:
+        assert isinstance(live_catalog, VendingCatalog)
+        assert isinstance(provider, CredentialProviderIceberg)
+        assert provider._catalog_.get() is live_catalog
+
+
+def test_sink_without_vending_unchanged(
+    sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+    real = pl.LazyFrame.sink_parquet
+
+    def spy(self: pl.LazyFrame, path: Any, **kw: Any) -> Any:
+        seen.update(kw)
+        return real(self, path, **kw)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", spy)
+    pl.DataFrame({"a": [3]}).lazy().sink_iceberg("ns.t", catalog=sales, mode="append")
+    assert "credential_provider" not in seen
+    assert seen["storage_options"] == {}
+
+
+def test_sink_staged_create_engages_no_provider(
+    vending: VendingCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pyiceberg.table import StagedTable
+
+    from polars.io.iceberg import _sink
+
+    # The catalog cannot vend credentials for a table it does not know yet.
+    provider = CredentialProviderIceberg(
+        IcebergCatalogConfig.from_catalog(vending), ("ns", "t2"), S3_LOC
+    )
+    calls: list[dict[str, Any]] = []
+
+    def vend(**kw: Any) -> tuple[dict[str, Any], CredentialProviderIceberg]:
+        calls.append(kw)
+        return {"aws_region": "eu-west-1"}, provider
+
+    monkeypatch.setattr(_sink, "catalog_credentials", vend)
+    seen: dict[str, Any] = {}
+    real = pl.LazyFrame.sink_parquet
+
+    def spy(self: pl.LazyFrame, path: Any, **kw: Any) -> Any:
+        seen.update(kw)
+        return real(self, path, **kw)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", spy)
+    lf = pl.DataFrame({"a": [3]}).lazy()
+    transaction = vending.create_table_transaction(
+        ("ns", "t2"), schema=lf.collect().to_arrow().schema
+    )
+    state = IcebergSinkState.new_create(transaction)
+    assert isinstance(state.table(), StagedTable)
+    state.attach_sink(lf).collect()
+
+    assert calls == []
+    assert "credential_provider" not in seen
+    assert seen["storage_options"] == {}
+    assert_frame_equal(
+        pl.scan_iceberg(vending.load_table(("ns", "t2"))).collect(),
+        pl.DataFrame({"a": [3]}),
+    )
+
+
+def test_native_scan_provider_asks_for_slash_terminated_data_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "pyiceberg")
+    vending = new_vending_catalog(tmp_path, with_load_credentials=True)
+    tbl = vending.load_table(("ns", "t"))
+    scan_data = new_iceberg_scan_resolver(tbl)._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    provider = scan_data.credential_provider
+    assert isinstance(provider, CredentialProviderIceberg)
+    provider()
+    assert vending.credential_location == tbl.location().rstrip("/") + "/"
+
+
+def test_sink_provider_asks_for_slash_terminated_data_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from polars.io.iceberg import _sink
+
+    vending = new_catalog(
+        tmp_path,
+        "vending",
+        pl.DataFrame({"a": [1, 2]}),
+        LoadCredentialsCatalog,
+    )
+    providers: list[CredentialProviderIceberg] = []
+    real = cred.catalog_credentials
+
+    def spy(**kw: Any) -> Any:
+        out = real(**kw)
+        if out[1] is not None:
+            providers.append(out[1])
+        return out
+
+    monkeypatch.setattr(_sink, "catalog_credentials", spy)
+    pl.DataFrame({"a": [3]}).lazy().sink_iceberg("ns.t", catalog=vending, mode="append")
+    assert providers
+    providers[0]()
+    # The sink's catalog, rebuilt from its config where the plan runs.
+    catalog = providers[0]._catalog_.get()
+    assert isinstance(catalog, LoadCredentialsCatalog)
+    location = vending.load_table(("ns", "t")).location()
+    assert catalog.credential_location == location.rstrip("/") + "/"
+
+
+@pytest.fixture(scope="module")
+def s3_base() -> Iterator[str]:
+    """A moto S3 server, after the one in `tests/unit/io/cloud/test_aws.py`."""
+    import socket
+
+    moto_server = pytest.importorskip("moto.server")
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = moto_server.ThreadedMotoServer("127.0.0.1", port)
+    server.start()
+    yield f"http://127.0.0.1:{port}"
+    server.stop()
+
+
+@pytest.mark.slow
+def test_refresh_end_to_end_on_s3(
+    s3_base: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("polars_iceberg")
+    boto3 = pytest.importorskip("boto3")
+    import polars._plr as plr
+    from polars.io.cloud.credential_provider._builder import (
+        CredentialProviderBuilder,
+    )
+
+    monkeypatch.setenv("POLARS_ICEBERG_PLANNER", "plugin")
+    # pyarrow's S3 writes otherwise send aws-chunked bodies that moto stores as is.
+    monkeypatch.setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
+    # An expiry of 0 makes both the Python and the Rust credential caches fetch
+    # again on every request; a past expiry other than 0 is an error in Rust.
+    monkeypatch.setattr(cred, "vended_expiry", lambda *args, **kwargs: 0)
+
+    boto3.client(
+        "s3",
+        region_name="us-east-1",
+        endpoint_url=s3_base,
+        aws_access_key_id="x",
+        aws_secret_access_key="y",
+    ).create_bucket(Bucket="bucket")
+
+    s3_properties: dict[str, Any] = {
+        "s3.endpoint": s3_base,
+        "s3.access-key-id": "x",
+        "s3.secret-access-key": "y",
+        "s3.region": "us-east-1",
+    }
+    cat = VendingCatalog(
+        "sales",
+        uri=f"sqlite:///{tmp_path}/c.db",
+        warehouse="s3://bucket/wh",
+        **s3_properties,
+    )
+    cat.create_namespace("ns")
+    tbl = cat.create_table(
+        ("ns", "t"), schema=pl.DataFrame({"a": [1]}).to_arrow().schema
+    )
+    pl.DataFrame({"a": [1]}).write_iceberg(tbl, mode="append")
+    pl.DataFrame({"a": [2]}).write_iceberg(tbl, mode="append")
+
+    seen: dict[str, Any] = {}
+    real_plugin_scan = plr._iceberg_plugin_scan
+
+    def recording_plugin_scan(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_plugin_scan(*args, **kwargs)
+
+    monkeypatch.setattr(plr, "_iceberg_plugin_scan", recording_plugin_scan)
+
+    resolver, _ = recording(cat)
+    pl.Config.set_iceberg_catalog_resolver(resolver)
+    before = cat.vends
+    out = pl.scan_iceberg(
+        "ns.t", catalog="sales", storage_options={"aws_endpoint_url": s3_base}
+    ).collect()
+
+    assert sorted(out["a"].to_list()) == [1, 2]
+    # One load_table at plan time, at least two provider fetches for two files.
+    assert cat.vends - before >= 3
+    builder = seen["credential_provider"]
+    assert isinstance(builder, CredentialProviderBuilder)
+    provider = builder.credential_provider_init.credential_provider  # type: ignore[attr-defined]
+    assert isinstance(provider, CredentialProviderIceberg)
+    assert provider.table_identifier == ("ns", "t")
+    assert "aws_access_key_id" not in (seen["storage_options"] or {})

@@ -1483,17 +1483,19 @@ def test_iceberg_plugin_catalog_storage_options(
     plmonkeypatch.setattr(
         table, "metadata_location", "s3://bucket/t/metadata/v1.metadata.json"
     )
+    properties = {
+        "s3.region": "eu-west-1",
+        "s3.access-key-id": "vended-key",
+        "s3.secret-access-key": "vended-secret",
+        # PyIceberg timeouts are in seconds.
+        "s3.connect-timeout": "60",
+        "s3.request-timeout": "1.5",
+    }
+    plmonkeypatch.setattr(table.io, "properties", properties)
+    # Configured on the catalog, so static: vended keys would be refreshed by a
+    # `CredentialProviderIceberg` instead.
     plmonkeypatch.setattr(
-        table.io,
-        "properties",
-        {
-            "s3.region": "eu-west-1",
-            "s3.access-key-id": "vended-key",
-            "s3.secret-access-key": "vended-secret",
-            # PyIceberg timeouts are in seconds.
-            "s3.connect-timeout": "60",
-            "s3.request-timeout": "1.5",
-        },
+        table.catalog, "properties", {**table.catalog.properties, **properties}
     )
 
     assert _capture_plugin_scan_storage_options(table, plmonkeypatch, None) == {

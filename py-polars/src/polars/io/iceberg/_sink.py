@@ -15,6 +15,10 @@ from polars._utils.wrap import wrap_ldf
 from polars.exceptions import ComputeError
 from polars.io.cloud._utils import NoPickleOption
 from polars.io.iceberg._catalog_resolver import check_catalog_name, resolve_catalog
+from polars.io.iceberg._credentials import (
+    catalog_credentials,
+    native_credential_location,
+)
 from polars.io.iceberg._dataset import (
     IcebergCatalogConfig,
 )
@@ -60,6 +64,7 @@ if TYPE_CHECKING:
         PolarsDataType,
         StorageOptionsDict,
     )
+    from polars.io.iceberg._credentials import CatalogSource
 
 
 # `(path, num_rows, num_bytes, parquet_metadata, partition_keys)`
@@ -1320,6 +1325,33 @@ class IcebergSinkState:
         state.table_ = _StagedTableOption(transaction._table)
         return state
 
+    def _catalog_class(self) -> type[pyiceberg.catalog.Catalog]:
+        assert self.py_catalog_class_module is not None
+        assert self.py_catalog_class_qualname is not None
+
+        module = importlib.import_module(self.py_catalog_class_module)
+        qualname_split = self.py_catalog_class_qualname.split(".")
+
+        catalog_class: type[pyiceberg.catalog.Catalog] = getattr(
+            module, qualname_split[0]
+        )
+
+        for part in qualname_split[1:]:
+            catalog_class = getattr(catalog_class, part)
+
+        return catalog_class
+
+    def catalog_source(self) -> CatalogSource:
+        """The catalog, by name or as a config to construct it from."""
+        if self.py_catalog_class_module is None:
+            return self.catalog_name
+
+        return IcebergCatalogConfig(
+            class_=self._catalog_class(),
+            name=self.catalog_name,
+            properties=self.catalog_properties,
+        )
+
     def table(self) -> pyiceberg.table.Table:
         if self.table_.get() is None:
             if (
@@ -1328,17 +1360,9 @@ class IcebergSinkState:
             ):
                 catalog = resolve_catalog(self.catalog_name)
             else:
-                module = importlib.import_module(self.py_catalog_class_module)
-                qualname_split = self.py_catalog_class_qualname.split(".")
-
-                catalog_class: type[pyiceberg.catalog.Catalog] = getattr(
-                    module, qualname_split[0]
+                catalog = self._catalog_class()(
+                    self.catalog_name, **self.catalog_properties
                 )
-
-                for part in qualname_split[1:]:
-                    catalog_class = getattr(catalog_class, part)
-
-                catalog = catalog_class(self.catalog_name, **self.catalog_properties)
             self.table_.set(self._load_or_create_table(catalog))
 
         return self.table_.get()  # type: ignore[return-value]
@@ -1446,7 +1470,7 @@ class IcebergSinkState:
         return evolved_schema, schema_to_pyarrow(source_schema)
 
     def _attach_resolved_sink(self, plf: PyLazyFrame) -> PyLazyFrame:
-        from pyiceberg.table import TableProperties
+        from pyiceberg.table import StagedTable, TableProperties
         from pyiceberg.utils.properties import property_as_bool, property_as_int
 
         import polars as pl
@@ -1533,6 +1557,37 @@ class IcebergSinkState:
                 estimated_compression_ratio * v, (1 << 64) - 1
             )
 
+        # The table's FileIO properties, as for scans. Vended credentials are
+        # refreshed by a provider (and left out of the options) when the catalog
+        # vends them.
+        credential_options: dict[str, Any]
+        if isinstance(table, StagedTable):
+            # A staged table is unknown to its catalog until the commit, so the
+            # catalog cannot refresh its credentials.
+            credential_options = {
+                "storage_options": self._get_converted_storage_options()
+            }
+        else:
+            static_options, provider = catalog_credentials(
+                catalog=self.catalog_source(),
+                table_identifier=tuple(table.name()),
+                location=native_credential_location(table),
+                catalog_properties=table.io.properties,
+                user_storage_options=self.iceberg_storage_properties,
+                on_unsupported="user_options",
+                configured_properties=table.catalog.properties,
+                live_catalog=table.catalog,
+            )
+            credential_options = {"storage_options": static_options or {}}
+            if provider is not None:
+                from polars.io.cloud.credential_provider._builder import (
+                    CredentialProviderBuilder,
+                )
+
+                credential_options["credential_provider"] = (
+                    CredentialProviderBuilder.from_initialized_provider(provider)
+                )
+
         return lf.sink_parquet(
             pl.PartitionBy(
                 _normalize_windows_iceberg_file_uri(
@@ -1550,8 +1605,8 @@ class IcebergSinkState:
             compression_level=self.compression_level,
             row_group_size=self.row_group_size,
             maintain_order=True if sort_order.fields else self.maintain_order,
-            storage_options=self._get_converted_storage_options(),
             lazy=True,
+            **credential_options,
         )._ldf
 
     def commit(self, sinked_files: list[_IcebergSinkedFile]) -> pl.DataFrame:

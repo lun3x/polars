@@ -166,12 +166,17 @@ def _credential_env_fingerprint() -> str:
     return hashlib.sha256(repr(env).encode()).hexdigest()
 
 
-def _file_io_scope(file_io: FileIO) -> str | None:
+def _file_io_scope(file_io: FileIO, *, without_credentials: bool = False) -> str | None:
     # `type()`, not `__class__`, which mocks and proxies can override.
     if qualified_type_name(type(file_io)) not in _BUILTIN_FILE_IO_CLASSES:
         return None
     try:
-        properties_scope = _properties_fingerprint(file_io.properties)
+        properties = file_io.properties
+        if without_credentials:
+            properties = {
+                k: v for k, v in properties.items() if not _is_credential_property(k)
+            }
+        properties_scope = _properties_fingerprint(properties)
     except Exception:
         # Properties that cannot be fingerprinted bypass the cache.
         return None
@@ -181,6 +186,23 @@ def _file_io_scope(file_io: FileIO) -> str | None:
     return hashlib.sha256(
         f"{properties_scope}:{_credential_env_fingerprint()}".encode()
     ).hexdigest()
+
+
+def _is_credential_property(key: str) -> bool:
+    """Whether a FileIO property holds catalog credentials or their expiry."""
+    from polars.io.iceberg._credentials import (
+        _CATALOG_CREDENTIAL_KEYS,
+        _S3_CLIENT_PROPERTIES,
+        ADLS_SAS_TOKEN,
+    )
+    from polars.io.iceberg._dataset import ICEBERG_TO_OBJECT_STORE_CONFIG_KEY_MAP
+
+    key = _S3_CLIENT_PROPERTIES.get(key, key)
+    return (
+        ICEBERG_TO_OBJECT_STORE_CONFIG_KEY_MAP.get(key) in _CATALOG_CREDENTIAL_KEYS
+        or key.startswith(f"{ADLS_SAS_TOKEN}.")
+        or "expires-at" in key
+    )
 
 
 # Unique tokens of credential provider objects. Not `id()`, which is reused after an
@@ -210,17 +232,27 @@ def _default_credential_provider_scope() -> str | None:
 
 
 def plugin_storage_scope(
-    file_io: FileIO, storage_options: Mapping[str, Any] | None
+    file_io: FileIO,
+    storage_options: Mapping[str, Any] | None,
+    provider_scope: bytes | None = None,
 ) -> str | None:
     """Cache scope of a scan planned by the plugin.
 
     The plugin reads with storage configured from the FileIO's properties, the
     user's storage options and Polars' default credential provider, so all are
     fingerprinted. None when one cannot be.
+
+    With `provider_scope` (e.g. a pickled `CredentialProviderIceberg`), the
+    catalog's credentials come from that provider: it is fingerprinted instead of
+    the credential properties, whose values change on every refresh.
     """
-    if (io_scope := _file_io_scope(file_io)) is None:
+    if (
+        io_scope := _file_io_scope(
+            file_io, without_credentials=provider_scope is not None
+        )
+    ) is None:
         return None
-    if (provider_scope := _default_credential_provider_scope()) is None:
+    if (default_provider_scope := _default_credential_provider_scope()) is None:
         return None
     try:
         options_scope = _properties_fingerprint(storage_options or {})
@@ -228,9 +260,10 @@ def plugin_storage_scope(
         return None
     if options_scope is None:
         return None
-    return hashlib.sha256(
-        f"{io_scope}:{options_scope}:{provider_scope}".encode()
-    ).hexdigest()
+    scope = f"{io_scope}:{options_scope}:{default_provider_scope}"
+    if provider_scope is not None:
+        scope += f":{provider_scope.hex()}"
+    return hashlib.sha256(scope.encode()).hexdigest()
 
 
 @dataclass
