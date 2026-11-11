@@ -9,7 +9,6 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias
 
 from polars._utils.logging import eprint
-from polars._utils.unstable import issue_unstable_warning
 from polars._utils.wrap import wrap_ldf
 from polars.exceptions import ComputeError
 from polars.io.cloud._utils import NoPickleOption
@@ -988,9 +987,6 @@ class IcebergSinkState:
             if not isinstance(target, str):
                 msg = "a catalog name requires a table identifier as `target`"
                 raise TypeError(msg)
-            issue_unstable_warning(
-                "passing a catalog name to `sink_iceberg` is considered unstable."
-            )
             # Only the name is kept: each process that loads the table, including
             # one that only commits, resolves it with its own resolver.
             catalog_fields: _SinkCatalogFields = (
@@ -1036,14 +1032,21 @@ class IcebergSinkState:
 
     def table(self) -> pyiceberg.table.Table:
         if self.table_.get() is None:
-            if (
-                self.py_catalog_class_module is None
-                or self.py_catalog_class_qualname is None
-            ):
+            class_module = self.py_catalog_class_module
+            class_qualname = self.py_catalog_class_qualname
+
+            if class_module is None and class_qualname is None:
                 catalog = resolve_catalog(self.catalog_name)
+            elif class_module is None or class_qualname is None:
+                msg = (
+                    "invalid Iceberg sink state: the catalog class module and "
+                    "qualname must both be set, or both be None to resolve the "
+                    f"catalog by name; found {class_module = }, {class_qualname = }"
+                )
+                raise ValueError(msg)
             else:
-                module = importlib.import_module(self.py_catalog_class_module)
-                qualname_split = self.py_catalog_class_qualname.split(".")
+                module = importlib.import_module(class_module)
+                qualname_split = class_qualname.split(".")
 
                 catalog_class: type[pyiceberg.catalog.Catalog] = getattr(
                     module, qualname_split[0]
